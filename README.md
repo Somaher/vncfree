@@ -145,6 +145,9 @@ Both ends speak RFB 3.3, 3.7 and 3.8. That means **the viewer built into every M
 connect to the server** — Screen Sharing.app asks for 3.3 and would otherwise be locked
 out — and the client is not fussy about what it connects to either.
 
+The server supports 8bpp and 32bpp true colour, including client-selected colour
+maxima and shifts. Raw, ZRLE, and cursor shapes use the negotiated pixel format.
+
 **The server will not start without a password.** An open VNC port hands the whole
 desktop to anyone who can reach it, and defaulting to "no password" is exactly the
 decision that makes remote-access software dangerous. It offers only VNC

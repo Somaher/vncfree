@@ -889,7 +889,11 @@ mod win {
 /// compose on the way out, so a client wanting different shifts still works.
 #[derive(Clone, Copy, Debug)]
 struct PixFmt {
+    bytes: usize,
     big_endian: bool,
+    rmax: u32,
+    gmax: u32,
+    bmax: u32,
     rshift: u32,
     gshift: u32,
     bshift: u32,
@@ -898,7 +902,11 @@ struct PixFmt {
 impl Default for PixFmt {
     fn default() -> PixFmt {
         PixFmt {
+            bytes: 4,
             big_endian: false,
+            rmax: 255,
+            gmax: 255,
+            bmax: 255,
             rshift: 16,
             gshift: 8,
             bshift: 0,
@@ -909,37 +917,78 @@ impl Default for PixFmt {
 impl PixFmt {
     fn parse(f: &[u8]) -> Res<PixFmt> {
         let (bpp, truecolour) = (f[0], f[3]);
-        if bpp != 32 || truecolour == 0 {
+        if !matches!(bpp, 8 | 32) || truecolour == 0 {
             return Err(format!(
                 "client asked for {bpp}bpp truecolour={truecolour}; vncfree-server only \
-                 serves 32bpp true colour"
+                 serves 8bpp and 32bpp true colour"
             )
             .into());
         }
-        Ok(PixFmt {
+        let fmt = PixFmt {
+            bytes: (bpp / 8) as usize,
             big_endian: f[2] != 0,
+            rmax: u16::from_be_bytes([f[4], f[5]]) as u32,
+            gmax: u16::from_be_bytes([f[6], f[7]]) as u32,
+            bmax: u16::from_be_bytes([f[8], f[9]]) as u32,
             rshift: f[10] as u32,
             gshift: f[11] as u32,
             bshift: f[12] as u32,
-        })
+        };
+        let mut mask = 0u32;
+        let mut depth = 0;
+        for (max, shift) in [
+            (fmt.rmax, fmt.rshift),
+            (fmt.gmax, fmt.gshift),
+            (fmt.bmax, fmt.bshift),
+        ] {
+            let bits = max.count_ones();
+            if max == 0 || max & (max + 1) != 0 || shift + bits > bpp as u32 {
+                return Err("invalid true colour maximum or shift".into());
+            }
+            let channel = max << shift;
+            if mask & channel != 0 {
+                return Err("overlapping true colour channels".into());
+            }
+            mask |= channel;
+            depth += bits;
+        }
+        if f[1] == 0 || f[1] > bpp || depth > f[1] as u32 {
+            return Err("invalid true colour depth".into());
+        }
+        Ok(fmt)
     }
 
     fn pixel(&self, p: u32) -> [u8; 4] {
-        let v = ((p >> 16) & 255) << self.rshift
-            | ((p >> 8) & 255) << self.gshift
-            | (p & 255) << self.bshift;
-        if self.big_endian {
+        let v = ((((p >> 16) & 255) * self.rmax + 127) / 255) << self.rshift
+            | ((((p >> 8) & 255) * self.gmax + 127) / 255) << self.gshift
+            | (((p & 255) * self.bmax + 127) / 255) << self.bshift;
+        // Endianness has no effect on a one-byte pixel.
+        if self.big_endian && self.bytes != 1 {
             v.to_be_bytes()
         } else {
             v.to_le_bytes()
         }
     }
 
-    /// A ZRLE "compressed pixel": the same pixel minus its unused byte. This is only
-    /// legal when all the colour fits in the low three bytes, which it does for any
-    /// shift of 16 or less. A client using an exotic layout gets Raw instead.
+    /// Bytes per ZRLE pixel: 8bpp keeps its one byte; 32bpp drops an unused byte.
+    fn cpixel_bytes(&self) -> usize {
+        if self.bytes == 1 {
+            1
+        } else {
+            3
+        }
+    }
+
+    /// A ZRLE "compressed pixel", padded to three bytes for storage. At 32bpp we
+    /// drop the unused byte only when the colour fits in the low three bytes.
+    /// A client using an exotic layout gets Raw instead.
     fn cpixel(&self, p: u32) -> Option<[u8; 3]> {
-        if self.rshift > 16 || self.gshift > 16 || self.bshift > 16 {
+        if self.bytes == 1 {
+            return Some([self.pixel(p)[0], 0, 0]);
+        }
+        let mask =
+            (self.rmax << self.rshift) | (self.gmax << self.gshift) | (self.bmax << self.bshift);
+        if mask & 0xff00_0000 != 0 {
             return None;
         }
         let b = self.pixel(p);
@@ -1264,13 +1313,14 @@ fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: u
 
     // What each form would cost in bytes, not counting the subencoding byte they all
     // pay. MAX means this tile cannot use that form at all.
-    let raw = 3 * w * h;
-    let plain_rle: usize = runs.iter().map(|(_, l)| 3 + run_bytes(*l)).sum();
+    let pixel_bytes = f.cpixel_bytes();
+    let raw = pixel_bytes * w * h;
+    let plain_rle: usize = runs.iter().map(|(_, l)| pixel_bytes + run_bytes(*l)).sum();
     let palette_rle = match n {
         // A lone pixel carries an index and no length, which is where this form beats
         // spelling the colour out per run.
         2..=127 => {
-            3 * n
+            pixel_bytes * n
                 + runs
                     .iter()
                     .map(|(_, l)| if *l == 1 { 1 } else { 1 + run_bytes(*l) })
@@ -1281,20 +1331,22 @@ fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: u
     let packed = match n {
         // Every row restarts on a byte boundary, so the padding is per row, not per
         // tile - it is most of the cost of a narrow edge tile.
-        2..=16 => 3 * n + h * (w * bits).div_ceil(8),
+        2..=16 => pixel_bytes * n + h * (w * bits).div_ceil(8),
         _ => usize::MAX,
     };
     let best = raw.min(plain_rle).min(palette_rle).min(packed);
 
     if n == 1 {
         // One colour for the whole tile, which is most of a typical desktop, and
-        // three bytes beats anything else here by construction.
+        // one pixel beats anything else here by construction.
         out.push(1);
-        out.extend_from_slice(&f.cpixel(palette[0]).unwrap_or([0; 3]));
+        out.extend_from_slice(
+            &f.cpixel(palette[0]).expect("ZRLE-compatible format")[..pixel_bytes],
+        );
     } else if best == packed {
         out.push(n as u8);
         for c in &palette {
-            out.extend_from_slice(&f.cpixel(*c).unwrap_or([0; 3]));
+            out.extend_from_slice(&f.cpixel(*c).expect("ZRLE-compatible format")[..pixel_bytes]);
         }
         // Indices are packed most-significant-bit first.
         for row in 0..h {
@@ -1316,7 +1368,7 @@ fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: u
     } else if best == palette_rle {
         out.push(128 + n as u8);
         for c in &palette {
-            out.extend_from_slice(&f.cpixel(*c).unwrap_or([0; 3]));
+            out.extend_from_slice(&f.cpixel(*c).expect("ZRLE-compatible format")[..pixel_bytes]);
         }
         for (colour, len) in &runs {
             let idx = palette.iter().position(|c| c == colour).unwrap() as u8;
@@ -1332,7 +1384,9 @@ fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: u
         // border over a busy background, where a photo or a gradient would not.
         out.push(128);
         for (colour, len) in &runs {
-            out.extend_from_slice(&f.cpixel(*colour).unwrap_or([0; 3]));
+            out.extend_from_slice(
+                &f.cpixel(*colour).expect("ZRLE-compatible format")[..pixel_bytes],
+            );
             write_run(out, *len);
         }
     } else {
@@ -1340,7 +1394,9 @@ fn encode_tile(out: &mut Vec<u8>, s: &Screen, x: usize, y: usize, w: usize, h: u
         out.push(0);
         for row in 0..h {
             for col in 0..w {
-                out.extend_from_slice(&f.cpixel(at(row, col)).unwrap_or([0; 3]));
+                out.extend_from_slice(
+                    &f.cpixel(at(row, col)).expect("ZRLE-compatible format")[..pixel_bytes],
+                );
             }
         }
     }
@@ -1408,7 +1464,7 @@ fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) ->
             Part::Cursor(ref c) => {
                 out.extend_from_slice(&(-239i32).to_be_bytes());
                 for p in &c.px {
-                    out.extend_from_slice(&fmt.pixel(*p));
+                    out.extend_from_slice(&fmt.pixel(*p)[..fmt.bytes]);
                 }
                 out.extend_from_slice(&c.mask);
             }
@@ -1435,7 +1491,7 @@ fn update(z: Option<&mut Compress>, s: &Screen, parts: &[Part], fmt: &PixFmt) ->
                     out.extend_from_slice(&0i32.to_be_bytes()); // Raw
                     for row in y..y + h {
                         for col in x..x + w {
-                            out.extend_from_slice(&fmt.pixel(s.px[row * s.w + col]));
+                            out.extend_from_slice(&fmt.pixel(s.px[row * s.w + col])[..fmt.bytes]);
                         }
                     }
                 }
@@ -2681,6 +2737,7 @@ mod tests {
             rshift: 0,
             gshift: 8,
             bshift: 16,
+            ..PixFmt::default()
         };
         assert_eq!(swapped.pixel(0x00AA_BBCC), [0xAA, 0xBB, 0xCC, 0]);
 
@@ -2692,12 +2749,154 @@ mod tests {
     }
 
     #[test]
-    fn a_non_32bpp_client_is_refused_with_a_clear_message() {
+    fn an_unsupported_pixel_format_is_refused_with_a_clear_message() {
         let mut f = PIXEL_FORMAT;
         f[0] = 16; // bits-per-pixel
         let e = PixFmt::parse(&f).unwrap_err().to_string();
         assert!(e.contains("32bpp"), "{e}");
         assert!(PixFmt::parse(&PIXEL_FORMAT).is_ok());
+    }
+
+    const RGB332: [u8; 16] = [8, 8, 0, 1, 0, 7, 0, 7, 0, 3, 5, 2, 0, 0, 0, 0];
+
+    #[test]
+    fn eight_bit_true_colour_scales_channels_and_honours_shifts() {
+        let f = PixFmt::parse(&RGB332).unwrap();
+        assert_eq!(f.pixel(0), [0; 4]);
+        assert_eq!(f.pixel(0x00ff_ffff), [255, 0, 0, 0]);
+        assert_eq!(f.pixel(0x00ff_0000)[0], 0xe0);
+        assert_eq!(f.pixel(0x0000_ff00)[0], 0x1c);
+        assert_eq!(f.pixel(0x0000_00ff)[0], 0x03);
+        assert_eq!(f.pixel(0x0080_8080)[0], 0x92);
+
+        // Also used by viewers: red in the low bits, blue in the high bits.
+        let mut alternate = RGB332;
+        alternate[2] = 1; // A single byte is unaffected by big-endian=true.
+        alternate[10..13].copy_from_slice(&[0, 3, 6]);
+        let f = PixFmt::parse(&alternate).unwrap();
+        assert_eq!(f.pixel(0x00ff_0000)[0], 0x07);
+        assert_eq!(f.pixel(0x0000_ff00)[0], 0x38);
+        assert_eq!(f.pixel(0x0000_00ff)[0], 0xc0);
+    }
+
+    #[test]
+    fn invalid_eight_bit_formats_are_refused() {
+        for (field, value) in [
+            (3, 0),
+            (1, 9),
+            (1, 7),
+            (5, 0),
+            (5, 5),
+            (10, 6),
+            (10, 255),
+            (11, 5),
+        ] {
+            let mut f = RGB332;
+            f[field] = value;
+            assert!(PixFmt::parse(&f).is_err(), "field {field}={value}");
+        }
+    }
+
+    #[test]
+    fn eight_bit_raw_and_cursor_updates_use_one_byte_per_pixel() {
+        let f = PixFmt::parse(&RGB332).unwrap();
+        let s = Screen {
+            w: 3,
+            h: 1,
+            px: vec![0x00ff_0000, 0x0000_ff00, 0x0000_00ff],
+        };
+        let parts = [
+            Part::Pixels {
+                x: 0,
+                y: 0,
+                w: 3,
+                h: 1,
+            },
+            Part::Cursor(Cursor {
+                w: 3,
+                h: 1,
+                hot_x: 1,
+                hot_y: 0,
+                px: s.px.clone(),
+                mask: vec![0xa0],
+            }),
+        ];
+        let msg = update(None, &s, &parts, &f).unwrap();
+        assert_eq!(&msg[16..19], &[0xe0, 0x1c, 0x03]);
+        assert_eq!(i32::from_be_bytes(msg[27..31].try_into().unwrap()), -239);
+        assert_eq!(&msg[31..], &[0xe0, 0x1c, 0x03, 0xa0]);
+    }
+
+    #[test]
+    fn eight_bit_zrle_uses_one_byte_colours_and_a_persistent_stream() {
+        let f = PixFmt::parse(&RGB332).unwrap();
+        let mut z = Compress::new(Compression::default(), true);
+        let mut decoder = flate2::Decompress::new(true);
+        let colour = |p: u32| {
+            let r = (p >> 5) * 255 / 7;
+            let g = ((p >> 2) & 7) * 255 / 7;
+            let b = (p & 3) * 255 / 3;
+            (r << 16) | (g << 8) | b
+        };
+        // Exercise solid, packed palette, plain RLE, palette RLE, and raw tiles.
+        let mut plain_rle = vec![128];
+        for p in 0..128u8 {
+            plain_rle.extend_from_slice(&[p, 3]);
+        }
+        let mut palette_rle = vec![160];
+        palette_rle.extend(0..32u8);
+        for index in 0..32u8 {
+            palette_rle.extend_from_slice(&[index | 128, 3]);
+        }
+        let mut palette_pixels: Vec<u32> = (0..32u32).flat_map(|p| [colour(p); 4]).collect();
+        for _ in 0..5 {
+            palette_pixels.extend((0..32u32).map(colour));
+            palette_rle.extend(0..32u8);
+        }
+        let mut raw = vec![0];
+        raw.extend(0..128u8);
+        let cases = [
+            (vec![0x00ff_0000; 16], 4, 4, vec![1, 0xe0]),
+            (
+                vec![
+                    0,
+                    0x00ff_ffff,
+                    0,
+                    0x00ff_ffff,
+                    0x00ff_ffff,
+                    0x00ff_ffff,
+                    0,
+                    0,
+                ],
+                4,
+                2,
+                vec![2, 0, 255, 0x50, 0xc0],
+            ),
+            (
+                (0..128u32).flat_map(|p| [colour(p); 4]).collect(),
+                64,
+                8,
+                plain_rle,
+            ),
+            (palette_pixels, 32, 9, palette_rle),
+            ((0..128u32).map(colour).collect(), 16, 8, raw),
+        ];
+        for (px, w, h, expected) in cases {
+            let s = Screen { w, h, px };
+            let msg = update(Some(&mut z), &s, &[Part::Pixels { x: 0, y: 0, w, h }], &f).unwrap();
+            assert_eq!(i32::from_be_bytes(msg[12..16].try_into().unwrap()), 16);
+            assert_eq!(
+                u32::from_be_bytes(msg[16..20].try_into().unwrap()) as usize,
+                msg.len() - 20
+            );
+            let mut decoded = vec![0; 4096];
+            let before = decoder.total_out();
+            decoder
+                .decompress(&msg[20..], &mut decoded, flate2::FlushDecompress::Sync)
+                .unwrap();
+            decoded.truncate((decoder.total_out() - before) as usize);
+            assert_eq!(decoded, expected);
+        }
     }
 
     fn tile_of(px: &[u32], w: usize, h: usize) -> Vec<u8> {
@@ -2824,6 +3023,7 @@ mod tests {
             rshift: 24,
             gshift: 16,
             bshift: 8,
+            ..PixFmt::default()
         };
         assert_eq!(high.cpixel(0x00AA_BBCC), None);
     }
