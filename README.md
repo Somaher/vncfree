@@ -57,7 +57,17 @@ vncfree 192.168.1.50:5900 frame.ppm    # grab one frame headless and exit
 
 $env:VNC_PASSWORD = 'up to 8 chars'
 vncfree-server                          # share this screen on 0.0.0.0:5900
+vncfree-server --password "secret" --headless  # no dialogs or console
 ```
+
+Server arguments: `--password VALUE` (or `--password=VALUE`) overrides
+`VNC_PASSWORD`. `--no-ui` (alias `--hide-ui`) disables all dialogs and fails if no
+password is supplied. `--hide-console` detaches the server from its console without
+hiding your terminal; `--headless` combines both. Use `--help` to list the options.
+With `--headless` or `--no-ui`, a missing password prints an error to stderr and
+exits with code 1 before detaching the console.
+Command-line passwords can be visible in process listings; `VNC_PASSWORD` remains
+available.
 
 Close the client window to quit — Escape is forwarded to the remote machine, so it
 can't also be the quit key.

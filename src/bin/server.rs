@@ -1549,6 +1549,56 @@ struct Shared {
 /// certainly launched by double-clicking and has no console to print to.
 static FROM_GUI: AtomicBool = AtomicBool::new(false);
 
+const USAGE: &str = "Usage: vncfree-server [OPTIONS]
+
+  --password VALUE   Set the password (overrides VNC_PASSWORD)
+  --no-ui            Disable dialogs; fail if no password is supplied
+  --hide-ui          Alias for --no-ui
+  --hide-console     Detach from the console
+  --headless         Disable dialogs and detach from the console
+  -h, --help         Show this help
+
+VNC_PASSWORD and the other VNC_* environment settings remain supported.
+VNC authentication uses only the first 8 password characters.";
+
+#[derive(Default)]
+struct Options {
+    password: Option<String>,
+    no_ui: bool,
+    hide_console: bool,
+    help: bool,
+}
+
+impl Options {
+    fn parse(args: impl IntoIterator<Item = String>) -> Res<Self> {
+        let mut options = Self::default();
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--password" => {
+                    let value = args.next().ok_or("--password requires a value")?;
+                    if value.starts_with("--") {
+                        return Err("--password requires a value; use --password=VALUE for a password starting with --".into());
+                    }
+                    options.password = Some(value);
+                }
+                "--no-ui" | "--hide-ui" => options.no_ui = true,
+                "--hide-console" => options.hide_console = true,
+                "--headless" => {
+                    options.no_ui = true;
+                    options.hide_console = true;
+                }
+                "-h" | "--help" => options.help = true,
+                _ if arg.starts_with("--password=") => {
+                    options.password = Some(arg["--password=".len()..].to_string());
+                }
+                _ => return Err("unknown argument; use --help for usage".into()),
+            }
+        }
+        Ok(options)
+    }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -1598,17 +1648,31 @@ fn ask_for_password(bind: &str) -> Res<Option<(String, String)>> {
 }
 
 fn run() -> Res<()> {
+    let options = Options::parse(std::env::args().skip(1))?;
+    if options.help {
+        println!("{USAGE}");
+        return Ok(());
+    }
     win::become_dpi_aware();
 
     // A password is mandatory. An unauthenticated VNC server on a listening port
     // hands the whole desktop to anyone who can reach it, and defaulting to open is
     // exactly the decision that makes remote-access software dangerous.
-    let mut password = std::env::var("VNC_PASSWORD").unwrap_or_default();
+    let mut password = options
+        .password
+        .unwrap_or_else(|| std::env::var("VNC_PASSWORD").unwrap_or_default());
     let mut bind = std::env::var("VNC_BIND").unwrap_or_else(|_| "0.0.0.0:5900".into());
 
-    // No password in the environment: ask for one. The dialog's Start button stays
+    // No password supplied: ask for one. The dialog's Start button stays
     // disabled until a password is typed, so there is no path to an open server.
     if password.is_empty() {
+        if options.no_ui {
+            return Err(
+                "no password supplied: --headless/--no-ui requires a nonempty \
+                        --password VALUE or VNC_PASSWORD; server was not started"
+                    .into(),
+            );
+        }
         FROM_GUI.store(true, Ordering::Relaxed);
         match ask_for_password(&bind)? {
             Some((p, b)) => {
@@ -1625,6 +1689,15 @@ fn run() -> Res<()> {
                     Note that VNC auth is DES and weak: tunnel over SSH or a VPN if \
                     the network is not trusted."
             .into());
+    }
+    // Validate credentials before detaching so startup errors reach stderr even
+    // when --headless was requested.
+    if options.hide_console {
+        // Detach this process only: hiding the console window would also hide
+        // the user's terminal when launched from an existing shell.
+        unsafe {
+            windows_sys::Win32::System::Console::FreeConsole();
+        }
     }
     if password.len() > 8 {
         eprintln!("warning: VNC auth uses only the first 8 characters of the password");
@@ -2592,6 +2665,38 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_arguments_set_password_and_visibility() {
+        let parse = |args: &[&str]| Options::parse(args.iter().map(|s| s.to_string())).unwrap();
+        let options = parse(&["--password", "a b=c", "--no-ui", "--hide-console"]);
+        assert_eq!(options.password.as_deref(), Some("a b=c"));
+        assert!(options.no_ui && options.hide_console);
+        let options = parse(&["--password=--secret", "--headless"]);
+        assert_eq!(options.password.as_deref(), Some("--secret"));
+        assert!(options.no_ui && options.hide_console);
+        let options = parse(&["--hide-ui"]);
+        assert!(options.no_ui && !options.hide_console);
+        let options = parse(&[]);
+        assert!(options.password.is_none());
+        assert!(!options.no_ui && !options.hide_console);
+        assert!(parse(&["--help"]).help);
+    }
+
+    #[test]
+    fn invalid_startup_arguments_fail_without_echoing_secrets() {
+        for args in [
+            vec!["--password"],
+            vec!["--password", "--headless"],
+            vec!["private-password"],
+        ] {
+            let error = Options::parse(args.iter().map(|s| s.to_string()))
+                .err()
+                .expect("invalid arguments must fail")
+                .to_string();
+            assert!(!error.contains("private-password"));
+        }
+    }
 
     /// The pointer on a second monitor is wholly off the shared one. That used to go
     /// out as an empty rectangle at x=4728 on a 3840-wide screen, and the client - right
