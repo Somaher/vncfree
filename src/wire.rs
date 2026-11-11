@@ -13,12 +13,72 @@
 
 use crate::Res;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
+
+/// A handshake watchdog plus bounded socket I/O. The watchdog closes slow-drip
+/// peers; socket timeouts also bound a pending Windows recv that shutdown on a
+/// duplicated handle does not wake. After dropping it, call session_timeouts on
+/// the live reader/writer handles before entering an idle-capable session.
+pub struct HandshakeDeadline {
+    cancel: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HandshakeDeadline {
+    pub fn new(socket: &TcpStream, timeout: std::time::Duration) -> io::Result<Self> {
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
+        let watchdog_socket = socket.try_clone()?;
+        let (cancel, receiver) = std::sync::mpsc::channel();
+        let mut deadline = Self {
+            cancel,
+            worker: None,
+        };
+        let worker = std::thread::Builder::new()
+            .name("rfb-handshake-deadline".into())
+            .spawn(move || {
+                if matches!(
+                    receiver.recv_timeout(timeout),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    let _ = watchdog_socket.shutdown(Shutdown::Both);
+                }
+            })?;
+        deadline.worker = Some(worker);
+        Ok(deadline)
+    }
+}
+
+impl Drop for HandshakeDeadline {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 /// The session both halves share. `rustls::Connection` covers a client and a server
 /// alike, so everything below is written once.
 pub type Tls = Arc<Mutex<rustls::Connection>>;
+
+/// Duplicate a transport socket while preserving per-handle I/O timeouts.
+pub fn clone_socket(socket: &TcpStream) -> io::Result<TcpStream> {
+    let cloned = socket.try_clone()?;
+    // Windows duplicate handles have per-handle timeout state.
+    cloned.set_read_timeout(socket.read_timeout()?)?;
+    cloned.set_write_timeout(socket.write_timeout()?)?;
+    Ok(cloned)
+}
+
+pub fn session_timeouts(reader: &WireRead, writer: &WireWrite) -> io::Result<()> {
+    for socket in [&reader.sock, &writer.sock] {
+        socket.set_read_timeout(None)?;
+        socket.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+    }
+    Ok(())
+}
 
 /// Bytes taken off the socket since the process started.
 ///
@@ -51,6 +111,8 @@ pub fn fingerprint(der: &[u8]) -> String {
 pub struct WireRead {
     sock: TcpStream,
     tls: Option<Tls>,
+    #[cfg(windows)]
+    ra2: Option<crate::ra2::Cipher>,
     /// Ciphertext off the socket that rustls has not taken yet. It accepts only as much
     /// as it can hold at once, so one socket read can easily contain more than it will
     /// take, and throwing the remainder away corrupts the stream from that point on.
@@ -67,6 +129,24 @@ pub struct WireRead {
 
 impl Read for WireRead {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(windows)]
+        if let Some(cipher) = &mut self.ra2 {
+            while self.at == self.plain.len() {
+                self.plain = cipher.read(&mut self.sock)?;
+                BYTES_IN.fetch_add(
+                    (self.plain.len() + 18) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.at = 0;
+            }
+            let n = out.len().min(self.plain.len() - self.at);
+            out[..n].copy_from_slice(&self.plain[self.at..self.at + n]);
+            self.at += n;
+            return Ok(n);
+        }
         let Some(tls) = self.tls.clone() else {
             let n = self.sock.read(out)?;
             BYTES_IN.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -120,10 +200,16 @@ impl Read for WireRead {
 pub struct WireWrite {
     sock: TcpStream,
     tls: Option<Tls>,
+    #[cfg(windows)]
+    ra2: Option<crate::ra2::Cipher>,
 }
 
 impl Write for WireWrite {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        #[cfg(windows)]
+        if let Some(cipher) = &mut self.ra2 {
+            return cipher.write(&mut self.sock, data);
+        }
         let Some(tls) = self.tls.clone() else {
             return self.sock.write(data);
         };
@@ -171,15 +257,22 @@ impl WireWrite {
 pub fn plain(sock: TcpStream) -> Res<(WireRead, WireWrite)> {
     Ok((
         WireRead {
-            sock: sock.try_clone()?,
+            sock: clone_socket(&sock)?,
             tls: None,
+            #[cfg(windows)]
+            ra2: None,
             raw: Vec::new(),
             raw_len: 0,
             raw_at: 0,
             plain: Vec::new(),
             at: 0,
         },
-        WireWrite { sock, tls: None },
+        WireWrite {
+            sock,
+            tls: None,
+            #[cfg(windows)]
+            ra2: None,
+        },
     ))
 }
 
@@ -326,6 +419,11 @@ pub fn check_known(host: &str, print: &str) -> Res<()> {
 
 fn check_known_at(path: &std::path::Path, host: &str, print: &str) -> Res<()> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
+    let kind = if host.starts_with("ra2:") {
+        "RSA key"
+    } else {
+        "certificate"
+    };
     for line in text.lines() {
         let mut f = line.split_whitespace();
         if f.next() != Some(host) {
@@ -337,11 +435,11 @@ fn check_known_at(path: &std::path::Path, host: &str, print: &str) -> Res<()> {
             // absent rather than refusing to connect over a mangled file.
             None => Ok(()),
             Some(seen) => Err(format!(
-                "{host} presented a different certificate than the one remembered.\n\
+                "{host} presented a different {kind} than the one remembered.\n\
                  \x20 remembered: {seen}\n\
                  \x20 offered:    {print}\n\
                  Either that machine's vncfree-server was reinstalled or its saved \
-                 certificate was deleted, or something is sitting between you and it \
+                 identity was deleted, or something is sitting between you and it \
                  reading the session.\n\
                  If the first is what happened, remove the {host} line from\n\
                  \x20 {}\n\
@@ -377,8 +475,10 @@ pub fn server(mut sock: TcpStream, me: &Identity) -> Res<(WireRead, WireWrite)> 
     let tls = Arc::new(Mutex::new(c));
     Ok((
         WireRead {
-            sock: sock.try_clone()?,
+            sock: clone_socket(&sock)?,
             tls: Some(tls.clone()),
+            #[cfg(windows)]
+            ra2: None,
             raw: vec![0; 16 * 1024],
             raw_len: 0,
             raw_at: 0,
@@ -388,6 +488,8 @@ pub fn server(mut sock: TcpStream, me: &Identity) -> Res<(WireRead, WireWrite)> 
         WireWrite {
             sock,
             tls: Some(tls),
+            #[cfg(windows)]
+            ra2: None,
         },
     ))
 }
@@ -486,8 +588,10 @@ pub fn client(mut sock: TcpStream) -> Res<(WireRead, WireWrite, String)> {
     let tls = Arc::new(Mutex::new(c));
     Ok((
         WireRead {
-            sock: sock.try_clone()?,
+            sock: clone_socket(&sock)?,
             tls: Some(tls.clone()),
+            #[cfg(windows)]
+            ra2: None,
             raw: vec![0; 16 * 1024],
             raw_len: 0,
             raw_at: 0,
@@ -497,14 +601,95 @@ pub fn client(mut sock: TcpStream) -> Res<(WireRead, WireWrite, String)> {
         WireWrite {
             sock,
             tls: Some(tls),
+            #[cfg(windows)]
+            ra2: None,
         },
         print,
     ))
 }
 
+/// Split a socket into independent authenticated RA2 record directions.
+#[cfg(windows)]
+pub(crate) fn ra2(sock: TcpStream, receive: &[u8], send: &[u8]) -> Res<(WireRead, WireWrite)> {
+    let (mut r, mut w) = plain(sock)?;
+    r.ra2 = Some(crate::ra2::Cipher::new(receive));
+    w.ra2 = Some(crate::ra2::Cipher::new(send));
+    Ok((r, w))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_drip_handshakes_cannot_reset_the_watchdog() {
+        use std::net::TcpListener;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let deadline = HandshakeDeadline::new(&socket, Duration::from_millis(60)).unwrap();
+        let (mut reader, writer) = plain(socket).unwrap();
+        let sending = std::thread::spawn(move || {
+            for _ in 0..64 {
+                if peer.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let result = reader.read_exact(&mut [0; 64]);
+        drop(deadline);
+        drop(reader);
+        drop(writer);
+        sending.join().unwrap();
+        assert!(
+            result.is_err(),
+            "per-read progress bypassed the handshake deadline"
+        );
+    }
+
+    #[test]
+    fn handshake_deadline_closes_a_silent_connection_and_can_be_cancelled() {
+        use std::net::TcpListener;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let deadline = HandshakeDeadline::new(&socket, Duration::from_millis(30)).unwrap();
+        let (mut reader, writer) = plain(socket).unwrap();
+        assert_eq!(
+            reader.sock.read_timeout().unwrap(),
+            Some(Duration::from_millis(30))
+        );
+        let result = reader.read(&mut [0]);
+        assert!(result.is_err() || matches!(result, Ok(0)));
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "handshake ignored its I/O bound"
+        );
+        drop(deadline);
+        drop(writer);
+
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let deadline = HandshakeDeadline::new(&socket, Duration::from_millis(30)).unwrap();
+        let (reader, mut writer) = plain(socket).unwrap();
+        drop(deadline);
+        session_timeouts(&reader, &writer).unwrap();
+        assert_eq!(reader.sock.read_timeout().unwrap(), None);
+        assert_eq!(writer.sock.read_timeout().unwrap(), None);
+        std::thread::sleep(Duration::from_millis(60));
+        writer.write_all(b"x").unwrap();
+        let mut byte = [0];
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+    }
 
     /// A scratch known_hosts path unique to each test, so the tests do not fight over
     /// one file or over the environment variable that would normally choose it.

@@ -78,6 +78,9 @@ pub fn apple_dh_auth(
 ) -> Res<()> {
     let generator = u16r(r)?;
     let key_len = u16r(r)? as usize;
+    if !(64..=512).contains(&key_len) {
+        return Err("DH key length must be between 64 and 512 bytes".into());
+    }
     let prime = blob(r, key_len)?;
     let server_pub = blob(r, key_len)?;
     if debug() {
@@ -169,7 +172,7 @@ pub fn vencrypt(
         return Err("server refused the X509Vnc subtype it had just offered".into());
     }
 
-    crate::wire::client(tcp.try_clone()?)
+    crate::wire::client(crate::wire::clone_socket(tcp)?)
 }
 
 /// Everything needed to open the connection again after it drops.
@@ -266,6 +269,9 @@ impl Vnc {
         let mut tcp = TcpStream::connect_timeout(&resolved, std::time::Duration::from_secs(10))
             .map_err(|e| format!("could not connect to {addr}: {e}"))?;
         tcp.set_nodelay(true)?;
+        tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+        let handshake =
+            crate::wire::HandshakeDeadline::new(&tcp, std::time::Duration::from_secs(15))?;
 
         // Everything up to the security type is read straight off the socket rather
         // than through a BufReader. A BufReader takes whatever has arrived, and if the
@@ -321,8 +327,13 @@ impl Vnc {
             );
         }
         let want_tls = crate::config::var("VNC_TLS").unwrap_or_default() == "require";
-        // VeNCrypt first: it is the only one of these that encrypts anything.
-        let chosen = if types.contains(&19) {
+        // Prefer full-session RA2 unless TLS is explicitly required.
+        let want_ra2 = crate::config::var("VNC_TLS").unwrap_or_default() == "ra2";
+        let chosen = if want_ra2 && !types.contains(&5) {
+            return Err("VNC_TLS=ra2 requires RSA-AES128 on the server".into());
+        } else if types.contains(&5) && !want_tls {
+            5
+        } else if types.contains(&19) {
             19 // VeNCrypt: TLS, then one of the others inside it
         } else if want_tls {
             return Err(format!(
@@ -358,6 +369,14 @@ impl Vnc {
             // not go unnoticed.
             crate::wire::check_known(addr, &print)?;
             (r, w, 2)
+        } else if chosen == 5 {
+            #[cfg(windows)]
+            {
+                let (r, w) = crate::ra2::client(tcp, addr, username, password)?;
+                (r, w, 5)
+            }
+            #[cfg(not(windows))]
+            return Err("RSA-AES128 requires Windows".into());
         } else {
             let (r, w) = crate::wire::plain(tcp)?;
             (r, w, chosen)
@@ -500,6 +519,8 @@ impl Vnc {
             h: height,
             px: vec![0; width * height],
         };
+        drop(handshake);
+        crate::wire::session_timeouts(r.get_ref(), &w)?;
         *out.lock().unwrap() = Some(w);
         Ok(Vnc {
             r,
@@ -1008,20 +1029,32 @@ pub fn compact_len(r: &mut impl Read) -> Res<usize> {
     Ok(len)
 }
 
-/// Pull the next block out of a zlib stream that spans the whole connection.
-pub fn inflate(z: &mut flate2::Decompress, input: &[u8], expect: usize) -> Res<Vec<u8>> {
-    let mut out = Vec::with_capacity(expect + 4096);
+/// Pull one block out of a persistent zlib stream with a hard output bound.
+pub fn inflate(z: &mut flate2::Decompress, input: &[u8], limit: usize) -> Res<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
     let mut consumed = 0;
     loop {
-        // decompress_vec only writes into spare capacity; it never grows the Vec.
-        if out.len() == out.capacity() {
-            out.reserve(expect.max(4096));
-        }
         let (in0, out0) = (z.total_in(), z.total_out());
-        z.decompress_vec(&input[consumed..], &mut out, flate2::FlushDecompress::None)?;
+        // One extra byte detects expansion beyond the limit, even when the
+        // legitimate output fills it exactly and zlib still has a flush to read.
+        let available = (limit - out.len()).saturating_add(1).min(buffer.len());
+        z.decompress(
+            &input[consumed..],
+            &mut buffer[..available],
+            flate2::FlushDecompress::None,
+        )?;
         consumed += (z.total_in() - in0) as usize;
+        let produced = (z.total_out() - out0) as usize;
+        if produced > limit - out.len() {
+            return Err("compressed rectangle exceeds its decoded size limit".into());
+        }
+        out.extend_from_slice(&buffer[..produced]);
         // No input taken and no output produced means the stream is drained.
         if z.total_in() == in0 && z.total_out() == out0 {
+            if consumed != input.len() {
+                return Err("compressed rectangle has unconsumed input".into());
+            }
             return Ok(out);
         }
     }
@@ -1041,6 +1074,9 @@ pub fn run_len(r: &mut impl Read) -> Res<usize> {
     loop {
         let b = u8r(r)?;
         len += b as usize;
+        if len > 64 * 64 {
+            return Err("ZRLE run exceeds the maximum tile size".into());
+        }
         if b != 255 {
             return Ok(len);
         }
@@ -1324,7 +1360,7 @@ impl Decoder {
             let z = blob(r, n)?;
             inflate(&mut self.tight[stream], &z, expect)?
         };
-        if data.len() < expect {
+        if data.len() != expect {
             return Err(format!("tight rect wanted {expect} bytes, got {}", data.len()).into());
         }
 
@@ -1406,7 +1442,8 @@ impl Decoder {
         let n = compact_len(r)?;
         let data = blob(r, n)?;
         let mut dec = jpeg_decoder::Decoder::new(&data[..]);
-        let px = dec.decode()?;
+        dec.set_max_decoding_buffer_size(w * h * 4);
+        dec.read_info()?;
         let info = dec.info().ok_or("a JPEG rectangle with no header")?;
         if info.width as usize != w || info.height as usize != h {
             return Err(format!(
@@ -1421,6 +1458,7 @@ impl Decoder {
             jpeg_decoder::PixelFormat::L8 => 1,
             f => return Err(format!("JPEG pixel format {f:?} is not supported").into()),
         };
+        let px = dec.decode()?;
         for row in 0..h {
             for col in 0..w {
                 let p = (row * w + col) * step;
@@ -1445,8 +1483,14 @@ impl Decoder {
         h: usize,
     ) -> Res<()> {
         let n = u32r(r)? as usize;
+        // A tile can spend at most four bytes per pixel (plain RLE), plus a
+        // subencoding byte and up to 127 three-byte palette entries.
+        let limit = w * h * 4 + w.div_ceil(64) * h.div_ceil(64) * 382;
+        if n > limit * 2 + 1024 {
+            return Err("ZRLE compressed length exceeds the rectangle size limit".into());
+        }
         let compressed = blob(r, n)?;
-        let data = inflate(&mut self.zlib, &compressed, w * h * 3)?;
+        let data = inflate(&mut self.zlib, &compressed, limit)?;
         let mut d: &[u8] = &data;
         // 64x64 tiles in raster order; the right and bottom edges may be smaller.
         for ty in (0..h).step_by(64) {
@@ -1455,6 +1499,9 @@ impl Decoder {
                 let th = (h - ty).min(64);
                 zrle_tile(&mut d, s, x + tx, y + ty, tw, th)?;
             }
+        }
+        if !d.is_empty() {
+            return Err("ZRLE rectangle has trailing decoded data".into());
         }
         Ok(())
     }
@@ -1566,6 +1613,53 @@ pub fn write_ppm(path: &str, s: &Screen) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_rectangles_cannot_expand_beyond_their_limit() {
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![0; 1024 * 1024]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let error = inflate(&mut flate2::Decompress::new(true), &compressed, 12).unwrap_err();
+        assert!(error.to_string().contains("decoded size limit"));
+        let exact = inflate(&mut flate2::Decompress::new(true), &compressed, 1024 * 1024).unwrap();
+        assert_eq!(exact.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn oversized_zrle_length_is_rejected_from_the_header() {
+        let mut screen = Screen::new(1, 1);
+        let error = Decoder::new()
+            .zrle(&mut &u32::MAX.to_be_bytes()[..], &mut screen, 0, 0, 1, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("compressed length"));
+        assert!(run_len(&mut &[255; 17][..]).is_err());
+    }
+
+    #[test]
+    fn jpeg_dimensions_are_checked_before_decoding_pixels() {
+        let mut jpeg = include_bytes!("../tests/fixtures/quadrants.jpg").to_vec();
+        let sof = jpeg
+            .windows(2)
+            .position(|m| m == [0xff, 0xc0] || m == [0xff, 0xc2])
+            .unwrap();
+        jpeg[sof + 5..sof + 9].copy_from_slice(&[255; 4]);
+        let mut body = compact(jpeg.len());
+        body.extend(jpeg);
+        let error = Decoder::new()
+            .tight_jpeg(&mut &body[..], &mut Screen::new(1, 1), 0, 0, 1, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("rectangle is 1x1"), "{error}");
+    }
+
+    #[test]
+    fn oversized_dh_keys_are_rejected_before_reading_the_prime() {
+        let bytes = [0, 2, 0xff, 0xff];
+        let error =
+            apple_dh_auth(&mut &bytes[..], &mut Vec::new(), "user", "password").unwrap_err();
+        assert!(error.to_string().contains("DH key length"));
+    }
     use crate::{cut_text_msg, from_latin1};
 
     /// 1024-bit MODP group (RFC 2409 group 2) - same 128-byte key length a Mac uses.

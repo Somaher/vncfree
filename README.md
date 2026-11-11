@@ -52,7 +52,7 @@ Both are driveable from a script or a shortcut. Starting the server without argu
 always opens its dialog. **Load config** is enabled when a saved server config can be
 decrypted and contains a password and valid listen address. Click it to fill in the
 fields, then **Start server** to apply the saved settings and start sharing.
-The server dialog also offers TLS mode, capture method, primary/all displays,
+The server dialog also offers session encryption, capture method, primary/all displays,
 and **Autostart at login**. **Start server** applies
 your edits and saves them encrypted. **Hide console after start** applies only to
 that launch and is never saved. **Load config** fills all persistent controls.
@@ -75,7 +75,7 @@ another server process.
 vncfree 192.168.1.50:5900              # connect
 vncfree 192.168.1.50:5900 frame.ppm    # grab one frame headless and exit
 
-$env:VNC_PASSWORD = 'up to 8 chars'
+$env:VNC_PASSWORD = 'your password'
 vncfree-server                          # open the server dialog
 vncfree-server --password "secret" --headless  # no dialogs or console
 ```
@@ -129,18 +129,18 @@ saved settings. A damaged file or a file that cannot be decrypted produces an er
 it is preserved until you reset it. In the no-argument dialog, an invalid config
 disables **Load config**; you can enter new settings and start to replace it.
 Config files always live under `%APPDATA%`;
-`VNC_STATE` only controls TLS state files.
+`VNC_STATE` controls transport identity and pinning files.
 
 | Variable | Effect |
 |---|---|
-| `VNC_PASSWORD` | Password. The server refuses to start without one. **Only the first 8 characters count** - that is VNC authentication, not a choice made here. |
+| `VNC_PASSWORD` | Password. The server refuses to start without one. RSA-AES128 checks the full UTF-8 password (up to 255 bytes); legacy VNC authentication, including inside TLS, uses only the first 8 bytes. |
 | `VNC_ADDRESS` | Client only. Prefills the saved connection address in the dialog. An address argument overrides it. |
 | `VNC_BIND` | Server only. Where to listen; default `0.0.0.0:5900`. |
 | `VNC_NO_UI` | Server only. `1` disables dialogs; `0` restores them when a password is needed. |
 | `VNC_HIDE_CONSOLE` | Server only. `1` detaches the console; `0` keeps it attached. |
 | `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
-| `VNC_TLS` | `offer` (default), `require` or `off`. On the client, `require` refuses to connect to a server that will not encrypt. |
-| `VNC_STATE` | Where the TLS state files below live. A path — `.` keeps them beside the executable — or `off` to disable TLS state persistence. |
+| `VNC_TLS` | `offer` (default): offer RSA-AES128, TLS and legacy VNC. `ra2`: require RSA-AES128. `require`: require VeNCrypt TLS. `off`: server offers legacy VNC only. The viewer prefers RSA-AES128 when offered; `ra2` and `require` refuse fallback. |
+| `VNC_STATE` | Where the transport identity and pinning files below live. A path — `.` keeps them beside the executable — or `off` to disable transport identity persistence. |
 | `VNC_ENCODING` | Client only. `raw`, `tight` or `zrle` to ask for exactly one. Answers "is it my decoder or the server?" |
 | `VNC_QUALITY` | Client only, `0`–`9`. Lets a Tight server send lossy JPEG, which is much smaller on a slow link. Unset means lossless. |
 | `VNC_DEBUG` | `1` prints the negotiated version, security types and clipboard traffic; `0` disables it. |
@@ -163,7 +163,8 @@ or Windows service.
 | `server.cfg` | Server settings and password, encrypted with Windows DPAPI. |
 | `client.cfg` | Windows client settings and password, encrypted with Windows DPAPI. |
 | `server-cert` | The server's TLS certificate and its private key, made on first run. Kept so its fingerprint stays the same, because one that changed on every restart would be a fingerprint nobody could check anything against. |
-| `known_hosts` | One line per address the **client** has connected to, with the certificate it saw. A plain text file. |
+| `server-rsa.dpapi` | RSA-2048 server private identity, encrypted with current-user Windows DPAPI. |
+| `known_hosts` | SHA-256 fingerprints of certificates or RSA keys seen by the viewer. RSA entries use `ra2:address` to keep the two identities separate. A plain text file. |
 
 The client trusts the first certificate it sees from an address and **refuses to connect
 if it ever changes**, which is what SSH does and for the same reason. It cannot make the
@@ -171,7 +172,7 @@ first connection safe — nothing can, without a certificate authority — but i
 someone who starts intercepting a connection you have used before.
 
 If a server really was rebuilt, delete its line from `known_hosts` and connect again.
-`VNC_STATE=off` disables TLS state files and certificate pinning. Encrypted `.cfg`
+`VNC_STATE=off` disables transport identity persistence and pinning; RSA keys and TLS certificates then change on restart. Encrypted `.cfg`
 settings are still loaded and saved.
 
 ## What it does
@@ -181,8 +182,8 @@ settings are still loaded and saved.
 | **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode. **Ctrl-Shift-V** types the local clipboard at the remote machine, for servers that will not share one. **Ctrl-Shift-M** shows the next monitor, against vncfree-server |
 | **Server** | Desktop Duplication capture with the cursor, keyboard and mouse injection, clipboard, mandatory password. An idle desktop costs about 20x less CPU than the `BitBlt` it falls back to |
 | **Encodings** | Raw, CopyRect, ZRLE, and Tight for servers that speak nothing else. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
-| **Authentication** | VNC password authentication (DES challenge-response). |
-| **Encryption** | TLS 1.3 over VeNCrypt, on by default, with the password exchanged inside it. `VNC_TLS=require` refuses to fall back |
+| **Authentication** | RSA-AES128 password authentication (full password), or legacy VNC DES challenge-response. |
+| **Encryption** | RSA-AES128 (RA2, security type 5): RSA-2048 key exchange and authenticated AES-128-EAX for the whole session. VeNCrypt TLS is also offered. Use `VNC_TLS=ra2` or `VNC_TLS=require` to require the respective mode. |
 | **Protocol checks** | TigerVNC and vncfree client/server sessions. |
 
 Both ends speak RFB 3.3, 3.7 and 3.8 for compatibility with other VNC clients
@@ -193,8 +194,7 @@ maxima and shifts. Raw, ZRLE, and cursor shapes use the negotiated pixel format.
 
 **The server will not start without a password.** An open VNC port hands the whole
 desktop to anyone who can reach it, and defaulting to "no password" is exactly the
-decision that makes remote-access software dangerous. It offers only VNC
-authentication, so there is no unauthenticated path at all.
+decision that makes remote-access software dangerous. Both RSA-AES128 and legacy VNC authentication require a password.
 
 ## Known limits
 
@@ -206,11 +206,13 @@ authentication, so there is no unauthenticated path at all.
   can also be pushed to the unencrypted one by someone in the middle — `VNC_TLS=require`
   at either end removes that choice. **Still don't port-forward this to the internet**:
   tunnel over SSH or a VPN.
-- **Encryption needs both ends to be vncfree.** VeNCrypt's other TLS modes use
-  anonymous Diffie-Hellman, which cannot detect anyone in the middle at all and which
-  no current TLS library implements; vncfree speaks the X509 form instead. Against
-  another client or server the connection falls back to plain VNC auth, which is DES
-  and weak by modern standards.
+- **Encrypted interoperability depends on the viewer.** Viewers supporting RA2 security
+  type 5 can use RSA-AES128; VeNCrypt viewers need the X509Vnc subtype. Other viewers
+  can use legacy VNC authentication when the server is in `offer` mode. Select
+  **Require RSA-AES128** in the server GUI to prevent unencrypted fallback.
+  RA2 uses protocol-mandated SHA-1 and RSA PKCS#1 v1.5; its name refers to the
+  AES key size, not the RSA key size. RA2ne (authentication-only encryption),
+  RA2r and RSA-AES256 are not implemented.
 - **Tight is decode-only.** The client reads it, so servers that offer nothing better
   are no longer stuck on Raw; the server still sends ZRLE, which is a comparable size
   and lossless. Encoding Tight well means a JPEG *encoder*, which is a lot of weight
@@ -257,6 +259,8 @@ authentication, so there is no unauthenticated path at all.
 
 - **[docs/security.md](docs/security.md)** — what the server hands over, what protects
   it, what does not, and what has been hardened against what.
+- **[docs/security-audit.md](docs/security-audit.md)** — security review findings,
+  dependency updates, fixes, and remaining limitations.
 - **[docs/design.md](docs/design.md)** — how it is put together, why each dependency is
   there, and the traps that cost real time.
 - **[docs/testing.md](docs/testing.md)** — standing up a real server to test against,

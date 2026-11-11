@@ -123,3 +123,24 @@ Two things nearly produced a false bug report:
   "is it all one colour?" said missing when it was fine. The taskbar at the bottom of
   the crop is what settled it. Compare against a `CopyFromScreen` of the same virtual
   desktop taken from a DPI-aware process, which is an independent capture path.
+
+## RSA-AES128 interoperability
+
+The normal Rust suite covers authenticated records (including an independent EAX
+vector), tamper/replay rejection, bounded keys, RSA padding, key verification and
+large bidirectional encrypted sessions. An additional independent Python peer tests
+both Windows release binaries: server password matching, DPAPI identity persistence,
+encrypted 8bpp Raw framebuffer data, tamper rejection and security mode offers;
+viewer decoding of encrypted frames and rejection of a changed server RSA key.
+Install PyCryptodome in a local environment, then run:
+
+```powershell
+python tests/ra2_interop.py target/x86_64-pc-windows-msvc/release/vncfree-server.exe
+```
+
+The script binds loopback with temporary APPDATA and cleans up its server processes.
+For a manual viewer test, choose **Require RSA-AES128** in the server GUI and connect
+with a viewer supporting RA2/type 5. Compare its RSA fingerprint on first connection.
+The vncfree viewer reports SHA-256; viewers using the RealVNC fingerprint convention
+show the first eight SHA-1 bytes of the same serialized RSA public key, also
+printed by the server as its viewer fingerprint.

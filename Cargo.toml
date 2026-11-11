@@ -1,6 +1,6 @@
 [package]
 name = "vncfree"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "A free VNC client and server for Windows. No subscription, no telemetry, no installer."
 repository = "https://github.com/sp00nznet/vncfree"
@@ -26,17 +26,21 @@ path = "src/bin/server.rs"
 # Crypto the auth schemes need. Ciphers and 1024-bit modular exponentiation are the
 # one place where hand-rolling is reckless rather than lazy.
 aes = "0.8"
+eax = "0.5"
+sha1 = "0.10"
+zeroize = "1.8"
 des = "0.8"
 md-5 = "0.10"
 num-bigint = "0.5.1"
 getrandom = "0.4.3"
 # ZRLE is deflate over run-length-encoded tiles.
 flate2 = "1.1.9"
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["ring", "pem"] }
 rustls-pki-types = "1.15.1"
 sha2 = "0.11.0"
 jpeg-decoder = { version = "0.3.2", default-features = false }
+subtle = "2.6.1"
 
 # Windows client: window and clipboard without the image-format baggage.
 [target.'cfg(windows)'.dependencies]

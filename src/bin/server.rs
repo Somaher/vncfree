@@ -9,12 +9,13 @@
 //! needs no conversion. Input is injected with SendInput.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flate2::{Compress, Compression, FlushCompress};
+use subtle::ConstantTimeEq;
 use vncfree::rfb::{shared_monitor, MONITORS};
 use vncfree::{blob, cut_text_msg, debug, rd, read_clipboard, u16r, u32r, u8r, vnc_des};
 use vncfree::{Res, Screen, PIXEL_FORMAT};
@@ -1626,9 +1627,10 @@ fn settings_fields(value: impl Fn(&str) -> Option<String>) -> Vec<vncfree::gui::
         Field::new("Password", true, true),
         Field::new("Listen on", false, true),
         Field::choice(
-            "TLS encryption",
+            "Session encryption",
             &[
-                ("offer", "Offer TLS"),
+                ("offer", "Offer RSA-AES128 / TLS"),
+                ("ra2", "Require RSA-AES128"),
                 ("require", "Require TLS"),
                 ("off", "Off"),
             ],
@@ -1685,12 +1687,50 @@ struct ServerForm {
     autostart: Option<bool>,
 }
 
+const MAX_CONNECTIONS: usize = 16;
+
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl ConnectionSlot {
+    fn acquire(count: &Arc<AtomicUsize>) -> Option<Self> {
+        let mut current = count.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_CONNECTIONS {
+                return None;
+            }
+            match count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self(count.clone())),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct CloseSocket(TcpStream);
+
+impl Drop for CloseSocket {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
 /// Edit server settings before serving anything, showing this machine's LAN address.
 fn ask_for_settings(bind: &str, password: &str, hide_console: bool) -> Res<Option<ServerForm>> {
     let note = match vncfree::gui::lan_ip() {
         Some(ip) => format!(
             "This machine is {ip} on the local network.\n\
-             Choose TLS encryption below. Do not port-forward this.\n\
+             Choose session encryption below. Do not port-forward this.\n\
              Tunnel over SSH or a VPN."
         ),
         None => "Could not work out this machine's local address.".to_string(),
@@ -1812,12 +1852,15 @@ fn run() -> Res<()> {
         }
     }
     if password.is_empty() {
-        return Err("set VNC_PASSWORD to a password of up to 8 characters.\n\
+        return Err("set VNC_PASSWORD to a nonempty password.\n\
                     vncfree-server will not run without one - an open VNC port gives \
                     anyone who can reach it full control of this desktop.\n\
                     Note that VNC auth is DES and weak: tunnel over SSH or a VPN if \
                     the network is not trusted."
             .into());
+    }
+    if password.len() > 255 {
+        return Err("password must fit in 255 UTF-8 bytes for RSA-AES128".into());
     }
     vncfree::config::save(&[("VNC_PASSWORD", &password), ("VNC_BIND", &bind)])?;
     if let Some(enabled) = autostart {
@@ -1832,16 +1875,28 @@ fn run() -> Res<()> {
             windows_sys::Win32::System::Console::FreeConsole();
         }
     }
-    if password.len() > 8 {
-        eprintln!("warning: VNC auth uses only the first 8 characters of the password");
+    if password.len() > 8 && TlsMode::from_env()? != TlsMode::RsaAes {
+        eprintln!("warning: legacy VNC/TLS auth uses only the first 8 bytes; RSA-AES128 checks the full password");
     }
 
     // One certificate for the life of the server, so the fingerprint printed here is
     // the one every client will see and can be compared against.
     let tls_mode = TlsMode::from_env()?;
     let me = match tls_mode {
-        TlsMode::Off => None,
+        TlsMode::Off | TlsMode::RsaAes => None,
         _ => Some(Arc::new(vncfree::wire::Identity::new()?)),
+    };
+
+    let rsa = if tls_mode != TlsMode::Off {
+        let identity = vncfree::ra2::Identity::new()?;
+        println!(
+            "RSA-AES128 server key {}\n  viewer fingerprint {}",
+            vncfree::wire::fingerprint(&identity.public),
+            vncfree::ra2::viewer_fingerprint(&identity.public)
+        );
+        Some(Arc::new(identity))
+    } else {
+        None
     };
 
     let listener =
@@ -1863,17 +1918,25 @@ fn run() -> Res<()> {
                 );
             }
         }
-        None => println!("VNC_TLS=off: this session will not be encrypted"),
+        None if tls_mode == TlsMode::Off => {
+            println!("VNC_TLS=off: this session will not be encrypted")
+        }
+        None => {}
     }
 
     // Shared by every connection, because the point is to remember an address across
     // the connections it keeps opening.
     let guard = Arc::new(Guard::default());
+    let connections = Arc::new(AtomicUsize::new(0));
 
     for stream in listener.incoming() {
         let stream = stream?;
+        let Some(slot) = ConnectionSlot::acquire(&connections) else {
+            continue;
+        };
         let password = password.clone();
         let me = me.clone();
+        let rsa = rsa.clone();
         let guard = guard.clone();
         let addr = stream.peer_addr().ok();
         let peer = addr.map(|a| a.to_string()).unwrap_or_default();
@@ -1883,8 +1946,20 @@ fn run() -> Res<()> {
             .map(|a| a.ip())
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         std::thread::spawn(move || {
+            let _slot = slot;
             println!("client connected: {peer}");
-            match serve(stream, &password, me.as_deref(), &guard, ip, ox, oy, w, h) {
+            match serve(
+                stream,
+                &password,
+                me.as_deref(),
+                rsa.as_deref(),
+                &guard,
+                ip,
+                ox,
+                oy,
+                w,
+                h,
+            ) {
                 Ok(()) => println!("client {peer} disconnected"),
                 Err(e) => println!("client {peer} finished: {e}"),
             }
@@ -1898,6 +1973,7 @@ fn serve(
     mut tcp: TcpStream,
     password: &str,
     me: Option<&vncfree::wire::Identity>,
+    rsa: Option<&vncfree::ra2::Identity>,
     guard: &Guard,
     peer: std::net::IpAddr,
     ox: i32,
@@ -1906,6 +1982,9 @@ fn serve(
     h: usize,
 ) -> Res<()> {
     tcp.set_nodelay(true)?;
+    tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let connection = CloseSocket(tcp.try_clone()?);
+    let handshake = vncfree::wire::HandshakeDeadline::new(&tcp, Duration::from_secs(15))?;
 
     // --- version ---
     tcp.write_all(b"RFB 003.008\n")?;
@@ -1942,68 +2021,62 @@ fn serve(
     }
 
     // --- security ---
-    // Whichever type is chosen, the password is checked the same way afterwards; all
-    // that differs is whether the rest of the session is encrypted.
+    // RA2 checks the full password inside its authenticated encrypted stream.
+    // Legacy VNC authentication retains DES for existing viewers.
     let tls_mode = TlsMode::from_env()?;
-    let mut encrypted = false;
+    let mut selected = 2;
     if old {
         // 3.3 has no negotiation: the server states the type as a u32, and that is it.
         // There is no way to offer TLS to a client this old.
-        if tls_mode == TlsMode::Require {
-            return Err(
-                "a client asked for RFB 3.3, which cannot negotiate TLS, and \
-                        VNC_TLS=require is set"
-                    .into(),
-            );
+        if matches!(tls_mode, TlsMode::Require | TlsMode::RsaAes) {
+            return Err("RFB 3.3 cannot negotiate the required encrypted security type".into());
         }
         tcp.write_all(&2u32.to_be_bytes())?;
     } else {
         let mut offer = vec![2u8]; // 2 = VNC auth, unencrypted
-        if tls_mode != TlsMode::Off {
+        if matches!(tls_mode, TlsMode::Offer | TlsMode::Require) {
             offer.insert(0, 19); // 19 = VeNCrypt
+        }
+        if rsa.is_some() {
+            offer.insert(0, 5);
         }
         if tls_mode == TlsMode::Require {
             offer.retain(|&t| t == 19);
         }
+        if tls_mode == TlsMode::RsaAes {
+            offer.retain(|&t| t == 5);
+        }
         tcp.write_all(&[offer.len() as u8])?;
         tcp.write_all(&offer)?;
-        match u8r(&mut tcp)? {
-            19 if tls_mode != TlsMode::Off => encrypted = true,
-            2 if tls_mode != TlsMode::Require => {}
-            other => {
-                return refuse(
-                    &mut tcp,
-                    old,
-                    format!("security type {other} was not offered").as_bytes(),
-                )
-            }
+        selected = u8r(&mut tcp)?;
+        if !offer.contains(&selected) {
+            return refuse(&mut tcp, old, b"security type was not offered");
         }
     }
 
-    // From here on everything goes through the wire halves, which are either the plain
-    // socket or the same socket with TLS over it.
-    let (reader, mut out) = match (encrypted, me) {
-        (true, Some(me)) => vencrypt(&mut tcp, me)?,
-        _ => vncfree::wire::plain(tcp)?,
+    let (reader, mut out, supplied) = if selected == 5 {
+        let (r, w, p) = vncfree::ra2::server(tcp, rsa.ok_or("RSA identity unavailable")?)?;
+        (r, w, Some(p))
+    } else if selected == 19 {
+        let (r, w) = vencrypt(&mut tcp, me.ok_or("TLS identity unavailable")?)?;
+        (r, w, None)
+    } else {
+        let (r, w) = vncfree::wire::plain(tcp)?;
+        (r, w, None)
     };
     let mut r = std::io::BufReader::new(reader);
 
-    let mut challenge = [0u8; 16];
-    getrandom::fill(&mut challenge)?;
-    out.write_all(&challenge)?;
-    let answer = rd::<16>(&mut r)?;
-    let mut expected = challenge;
-    vnc_des(&mut expected, password);
-    // Compared without an early exit. `==` on an array stops at the first byte that
-    // differs, and how long that takes is something the other end can measure - which
-    // over enough attempts turns guessing the whole response into guessing it one byte
-    // at a time. The rate limit above already makes that impractical; this makes the
-    // question not arise.
-    let wrong = answer
-        .iter()
-        .zip(expected.iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        != 0;
+    let wrong = if let Some(supplied) = supplied {
+        !bool::from(supplied.as_slice().ct_eq(password.as_bytes()))
+    } else {
+        let mut challenge = [0u8; 16];
+        getrandom::fill(&mut challenge)?;
+        out.write_all(&challenge)?;
+        let answer = rd::<16>(&mut r)?;
+        let mut expected = challenge;
+        vnc_des(&mut expected, password);
+        !bool::from(answer.ct_eq(&expected))
+    };
     if wrong {
         let wait = guard.failed(peer);
         println!(
@@ -2033,6 +2106,8 @@ fn serve(
     init.extend_from_slice(&(name.len() as u32).to_be_bytes());
     init.extend_from_slice(name.as_bytes());
     out.write_all(&init)?;
+    drop(handshake);
+    vncfree::wire::session_timeouts(r.get_ref(), &out)?;
 
     let shared = Arc::new(Shared {
         out: Mutex::new(out),
@@ -2053,7 +2128,9 @@ fn serve(
     });
 
     let sender = shared.clone();
-    std::thread::spawn(move || {
+    let sender_socket = connection.0.try_clone()?;
+    let worker = std::thread::spawn(move || {
+        let _connection = CloseSocket(sender_socket);
         if let Err(e) = send_frames(&sender, ox, oy, w, h) {
             if sender.alive.load(Ordering::Relaxed) {
                 eprintln!("sender stopped: {e}");
@@ -2065,6 +2142,8 @@ fn serve(
     let result = read_client(&mut r, &shared);
     // Wakes the sender out of its wait rather than leaving it to time out.
     shared.stop();
+    let _ = connection.0.shutdown(Shutdown::Both);
+    let _ = worker.join();
     result
 }
 
@@ -2176,31 +2255,56 @@ fn idle(ms: u64) {
 #[derive(Default)]
 struct Guard {
     /// Address -> how many times it has failed, and when it may try again.
-    seen: Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
+    seen: Mutex<std::collections::HashMap<std::net::IpAddr, Failure>>,
+}
+
+struct Failure {
+    count: u32,
+    until: std::time::Instant,
+    last: std::time::Instant,
 }
 
 /// Longest an address is ever made to wait. Long enough to make guessing hopeless,
 /// short enough that a typo is not a lockout.
 const MAX_BACKOFF: u64 = 30;
+const MAX_GUARD_ENTRIES: usize = 4096;
+const FAILURE_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 impl Guard {
     /// How much longer this address must wait, if it is serving a penalty.
     fn penalty(&self, ip: std::net::IpAddr) -> Option<Duration> {
         let mut seen = self.seen.lock().unwrap();
-        // Forget addresses that have served their time, so this cannot grow without
-        // bound from connection attempts alone.
-        seen.retain(|_, (_, until)| *until > std::time::Instant::now());
+        let now = std::time::Instant::now();
+        // Keep failure counts beyond the current penalty; removing them as soon
+        // as the penalty expired let serial guesses always restart at two seconds.
+        seen.retain(|_, failure| now.saturating_duration_since(failure.last) < FAILURE_RETENTION);
         seen.get(&ip)
-            .map(|(_, until)| until.saturating_duration_since(std::time::Instant::now()))
+            .map(|failure| failure.until.saturating_duration_since(now))
             .filter(|d| !d.is_zero())
     }
 
     fn failed(&self, ip: std::net::IpAddr) -> Duration {
         let mut seen = self.seen.lock().unwrap();
-        let e = seen.entry(ip).or_insert((0, std::time::Instant::now()));
-        e.0 += 1;
-        let wait = Duration::from_secs((1u64 << e.0.min(5)).min(MAX_BACKOFF));
-        e.1 = std::time::Instant::now() + wait;
+        let now = std::time::Instant::now();
+        seen.retain(|_, failure| now.saturating_duration_since(failure.last) < FAILURE_RETENTION);
+        if !seen.contains_key(&ip) && seen.len() >= MAX_GUARD_ENTRIES {
+            if let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, failure)| failure.last)
+                .map(|(ip, _)| *ip)
+            {
+                seen.remove(&oldest);
+            }
+        }
+        let e = seen.entry(ip).or_insert(Failure {
+            count: 0,
+            until: now,
+            last: now,
+        });
+        e.count = e.count.saturating_add(1);
+        let wait = Duration::from_secs((1u64 << e.count.min(5)).min(MAX_BACKOFF));
+        e.until = now + wait;
+        e.last = now;
         wait
     }
 
@@ -2216,6 +2320,7 @@ enum TlsMode {
     /// because a client that has never heard of VeNCrypt still has to be able to
     /// connect - macOS's own viewer among them.
     Offer,
+    RsaAes,
     /// Offer VeNCrypt only. Anyone in the middle of the connection can strip an
     /// encrypted option out of a list that also contains an unencrypted one, so a
     /// session that must be private cannot be left to the client to choose.
@@ -2229,7 +2334,8 @@ impl TlsMode {
             "" | "offer" => Ok(TlsMode::Offer),
             "require" => Ok(TlsMode::Require),
             "off" => Ok(TlsMode::Off),
-            other => Err(format!("VNC_TLS={other:?}: expected offer, require or off").into()),
+            "ra2" => Ok(TlsMode::RsaAes),
+            other => Err(format!("VNC_TLS={other:?}: expected offer, require, off or ra2").into()),
         }
     }
 }
@@ -2269,7 +2375,7 @@ fn vencrypt(
     }
     tcp.write_all(&[1])?;
 
-    vncfree::wire::server(tcp.try_clone()?, me)
+    vncfree::wire::server(vncfree::wire::clone_socket(tcp)?, me)
 }
 
 /// Refuse before offering any security type at all, which is the one place in RFB where
@@ -2800,13 +2906,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failure_counts_survive_an_expired_backoff() {
+        let guard = Guard::default();
+        let ip = "127.0.0.1".parse().unwrap();
+        assert_eq!(guard.failed(ip), Duration::from_secs(2));
+        guard.seen.lock().unwrap().get_mut(&ip).unwrap().until =
+            std::time::Instant::now() - Duration::from_secs(1);
+        assert!(guard.penalty(ip).is_none());
+        assert_eq!(guard.failed(ip), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn connection_admission_is_bounded_and_slots_are_released() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut slots: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| ConnectionSlot::acquire(&count).unwrap())
+            .collect();
+        assert!(ConnectionSlot::acquire(&count).is_none());
+        slots.pop();
+        assert!(ConnectionSlot::acquire(&count).is_some());
+        drop(slots);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn password_failure_tracking_has_a_size_limit() {
+        let guard = Guard::default();
+        let now = std::time::Instant::now();
+        for n in 0..MAX_GUARD_ENTRIES {
+            guard.seen.lock().unwrap().insert(
+                std::net::Ipv4Addr::from(n as u32).into(),
+                Failure {
+                    count: 1,
+                    until: now,
+                    last: now,
+                },
+            );
+        }
+        guard.failed("192.0.2.1".parse().unwrap());
+        assert_eq!(guard.seen.lock().unwrap().len(), MAX_GUARD_ENTRIES);
+    }
+
+    #[test]
     fn invalid_saved_gui_settings_are_rejected_before_loading() {
         let mut fields = settings_fields(|_| None);
         assert!(validate_settings(&fields).is_none());
         fields[2].value = "not-a-tls-mode".into();
         assert!(validate_settings(&fields)
             .unwrap()
-            .contains("TLS encryption"));
+            .contains("Session encryption"));
         fields[2].value = "require".into();
         fields[1].value = "127.0.0.1:99999".into();
         assert!(validate_settings(&fields).is_some());

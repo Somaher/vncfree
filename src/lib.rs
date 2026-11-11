@@ -10,6 +10,8 @@ pub mod autostart;
 pub mod config;
 #[cfg(windows)]
 pub mod gui;
+#[cfg(windows)]
+pub mod ra2;
 pub mod rfb;
 pub mod wire;
 
@@ -82,9 +84,6 @@ pub const MAX_TEXT: usize = 64 * 1024;
 pub fn text(s: &mut impl Read) -> Res<String> {
     let n = u32r(s)? as usize;
     if n > MAX_TEXT {
-        // Read past it rather than trusting it: this is reached during the handshake,
-        // before either end has proved anything to the other.
-        skip(s, n)?;
         return Err(format!("peer sent a {n}-byte string where a line of text belongs").into());
     }
     Ok(String::from_utf8_lossy(&blob(s, n)?).into_owned())
@@ -153,18 +152,12 @@ pub const PIXEL_FORMAT: [u8; 16] = [
 /// peer, so without it a clipboard message is a request to allocate anything at all.
 pub const MAX_CLIPBOARD: usize = 1024 * 1024;
 
-/// Take a clipboard body off the wire, ignoring one too big to be meant seriously.
-///
-/// Ignoring rather than refusing: an over-large clipboard is far more likely to be
-/// somebody copying a whole file by accident than an attack, and dropping the session
-/// over it would be a poor trade. The bytes are still read, because leaving them would
-/// desynchronise every message after this one.
+/// Read a bounded clipboard message. Oversized messages end the session without
+/// waiting for a peer to send an arbitrarily large body.
 pub fn read_clipboard(s: &mut impl Read) -> Res<Option<String>> {
     let n = u32r(s)? as usize;
     if n > MAX_CLIPBOARD {
-        skip(s, n)?;
-        eprintln!("ignoring a {n}-byte clipboard, over the {MAX_CLIPBOARD}-byte limit");
-        return Ok(None);
+        return Err(format!("clipboard length {n} exceeds the {MAX_CLIPBOARD}-byte limit").into());
     }
     Ok(Some(from_latin1(&blob(s, n)?)))
 }
@@ -260,11 +253,11 @@ mod tests {
             "{e}"
         );
 
-        // A clipboard over the limit is skipped rather than ending the session: much
-        // more likely to be a fat copy than an attack.
+        // Oversized messages fail from the header alone, without draining a body.
         let mut clip = (MAX_CLIPBOARD as u32 + 1).to_be_bytes().to_vec();
         clip.resize(clip.len() + MAX_CLIPBOARD + 1, b'a');
-        assert_eq!(read_clipboard(&mut &clip[..]).unwrap(), None);
+        assert!(read_clipboard(&mut &clip[..4]).is_err());
+        assert!(text(&mut &msg[..4]).is_err());
 
         // And one inside it still arrives.
         let mut ok = 2u32.to_be_bytes().to_vec();

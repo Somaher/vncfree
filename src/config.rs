@@ -45,6 +45,9 @@ pub use windows::{apply_saved, init, init_empty, save, saved};
 #[cfg(windows)]
 pub use windows::override_values;
 
+#[cfg(windows)]
+pub(crate) use windows::protect;
+
 pub fn enabled(key: &str) -> bool {
     var(key).is_ok_and(|value| !value.is_empty() && value != "0")
 }
@@ -212,7 +215,7 @@ mod windows {
         decode(&protect(&encrypted, true)?)
     }
 
-    fn protect(data: &[u8], decrypt: bool) -> Res<Vec<u8>> {
+    pub(crate) fn protect(data: &[u8], decrypt: bool) -> Res<Vec<u8>> {
         let input = CRYPT_INTEGER_BLOB {
             cbData: data.len().try_into()?,
             pbData: data.as_ptr() as *mut u8,

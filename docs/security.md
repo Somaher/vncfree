@@ -2,6 +2,9 @@
 
 This customized Windows version is used in a LAN environment.
 
+See the [2026-11-11 review](security-audit.md) for dependency updates, code fixes,
+regression coverage, and remaining limitations.
+
 What this program hands over, what protects it, and what does not. Written plainly
 because a remote-desktop tool that is vague about this is not worth trusting.
 
@@ -20,9 +23,9 @@ because that is what it is.
 
 | | |
 |---|---|
-| **In transit** | TLS 1.3, on by default, negotiated through VeNCrypt. The password is exchanged inside it. |
-| **Server identity** | A self-signed certificate, kept across restarts. The client remembers it per address and refuses to connect if it changes. |
-| **The password** | VNC authentication: a DES challenge-response. |
+| **In transit** | RSA-AES128 (RA2) authenticates and encrypts every record with AES-128-EAX after an RSA-2048 exchange. VeNCrypt TLS is also offered. |
+| **Server identity** | Persistent RSA key (DPAPI protected) or TLS certificate. The viewer pins SHA-256 fingerprints separately per address and transport. |
+| **The password** | Full password inside RA2; legacy VNC DES challenge-response inside TLS or plain TCP. |
 | **Guessing** | Each failure from an address pushes back when that address may try again, up to 30 seconds. |
 
 ## What does not protect it
@@ -33,13 +36,13 @@ because that is what it is.
   the first connection matters, compare the fingerprints both ends print.
 - **VNC authentication is weak.** DES, and only the first **8 characters** of the
   password are used at all — everything after that is ignored, so a 20-character
-  passphrase is an 8-character password. It is the only scheme the protocol offers that
-  every client understands, which is why it is here. Inside TLS the exchange is not
+  passphrase is an 8-character password. This limit applies to legacy VNC authentication, including inside TLS.
+  RSA-AES128 checks the full UTF-8 password, up to 255 bytes. Inside TLS the exchange is not
   visible to the network; without TLS it is, and a captured exchange can be attacked
   offline at leisure.
 - **A server that offers both encrypted and unencrypted connections can be pushed to
   the unencrypted one** by somebody in the middle, because the choice is the client's
-  and the list is not signed. `VNC_TLS=require` at either end removes the choice.
+  and the list is not signed. `VNC_TLS=ra2` requires RA2; `VNC_TLS=require` requires TLS at either end.
 - **Nothing here defends the machine against the person who logged in.** If someone has
   the password they are that user.
 
@@ -89,3 +92,12 @@ the dependency tree turns up there rather than in a user's hands.
 
 Open an issue. This is a small program with no users to coordinate with and nothing to
 embargo, and a public issue gets it fixed faster than a private one.
+
+RA2 follows the [RFB RSA-AES wire specification](https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#rsa-aes-security-type).
+It uses protocol-mandated SHA-1 for key derivation and transcript hashes and
+RSA PKCS#1 v1.5 for encrypted randoms. Native Windows CNG performs RSA operations;
+invalid RSA ciphertexts continue with a random secret and receive no padding-specific
+error. This is a compatibility protocol, not a substitute for a modern VPN.
+`VNC_STATE=off` disables persistent identities and viewer pinning for both transports.
+The earlier security audit predates RA2; these additions have functional and independent
+wire tests, but have not had a separate cryptographic security review.

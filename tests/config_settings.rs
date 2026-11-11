@@ -176,3 +176,66 @@ fn autostart_helper_dispatch_does_not_read_the_password_config() {
         b"not decryptable under another account"
     );
 }
+
+#[test]
+fn unauthenticated_connections_are_capped_and_disconnected_slots_are_reused() {
+    let fixture = Fixture::new();
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut command = fixture.command();
+    command
+        .args(["--headless", "--password", "testpass"])
+        .env("VNC_BIND", format!("127.0.0.1:{port}"))
+        .env("VNC_TLS", "off");
+    let mut server = Server(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut clients = Vec::new();
+    while clients.len() < 16 {
+        assert!(server.0.try_wait().unwrap().is_none());
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut version = [0; 12];
+                stream.read_exact(&mut version).unwrap();
+                assert_eq!(&version, b"RFB 003.008\n");
+                clients.push(stream);
+            }
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => panic!("server never started: {error}"),
+        }
+    }
+    let mut excess = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    excess
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    match excess.read(&mut [0]) {
+        Ok(n) => assert_eq!(n, 0),
+        Err(error) => assert!(!matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        )),
+    }
+    drop(clients);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut replacement = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        replacement
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut version = [0; 12];
+        if replacement.read_exact(&mut version).is_ok() {
+            assert_eq!(&version, b"RFB 003.008\n");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection slots leaked after disconnect"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}

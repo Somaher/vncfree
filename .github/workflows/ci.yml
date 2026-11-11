@@ -23,8 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@v4 # 11d5960a326750d5838078e36cf38b85af677262 
         with:
-          tool: cargo-audit
+          persist-credentials: false
+      - uses: taiki-e/install-action@v2 # cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 
+        with:
+          tool: cargo-audit@0.23.0
       # Fails on a vulnerability. Warnings - an unmaintained crate, say - are printed
       # and do not fail: minifb pulls in `instant`, which is unmaintained and is not
       # even in the Windows dependency graph, so failing on that would train us to
@@ -34,14 +38,17 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4 # 11d5960a326750d5838078e36cf38b85af677262 
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable # b725eda525362e7cf34af9a7243cac1e3f01a7ec 
+        with:
+          toolchain: stable
           components: clippy, rustfmt
 
       # Without this every run recompiles the whole dependency tree.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2 # d1527c8f67ef9af357290475d4af4b0fab8f12e0 
 
       # --locked fails if Cargo.lock would change, so CI builds exactly what was
       # committed rather than silently picking up new dependency versions.
@@ -52,15 +59,13 @@ jobs:
 
       # Both binaries. Shipping a release with only the viewer in it would be a
       # strange thing to do to a project whose point is that the server is free too.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4 # ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: vncfree-windows-x64
           path: |
             target/release/vncfree.exe
             target/release/vncfree-server.exe
 
-      # Only on a version tag: publish on the Releases page so people can download
-      # without building, or trusting a binary from anywhere else.
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
