@@ -4,23 +4,22 @@ Why things are the way they are, and the traps that cost real time getting here.
 
 ## Shape
 
-Rust, two self-contained executables, no runtime to install, plus an Android app
-that runs the same client engine. Shared RFB protocol pieces live in `src/lib.rs`:
-the wire primitives, the framebuffer layout, the VNC-auth key derivation (one side
-answers the challenge, the other sets it) and the clipboard text encoding. The client's
-handshake, authentication and decoders live in `src/rfb.rs` rather than in the viewer
-binary, so the Windows window and the Android app are two front ends on one engine and
-a decoder fix lands in both. Encoding stays in the server binary.
+This customized Windows version consists of two self-contained executables, with
+no runtime to install, for use in a LAN environment. Shared RFB protocol pieces live
+in `src/lib.rs`: wire primitives, the framebuffer layout, VNC-auth key derivation,
+and clipboard text encoding. The client's handshake, authentication, and decoders
+live in `src/rfb.rs`; the Windows viewer supplies its window and input handling.
+Encoding stays in the server binary.
 
 ```
 src/lib.rs         shared protocol
 src/rfb.rs         the client engine: connect, authenticate, decode
 src/wire.rs        the transport: a socket, or a socket with TLS over it
 src/gui.rs         the native dialog, shared
+src/config.rs      encrypted per-user settings
+src/autostart.rs   per-user Task Scheduler login startup
 src/bin/client.rs  Windows viewer: window, keyboard, mouse, clipboard
 src/bin/server.rs  screen sharing
-android/jni        the engine exposed to Kotlin over JNI, as libvncfree_jni.so
-android/app        Android viewer: Compose screen, touch, soft keyboard
 ```
 
 ## Dependencies
@@ -257,8 +256,8 @@ which is not what this is for.
 
 Both ends speak 3.3, 3.7 and 3.8. The version reply is a *choice* and may not exceed
 what the server offered, so a 3.3 server has to be answered with 3.3; anything at or
-above 8 is answered with 8, which is what makes Apple's `RFB 003.889` fall back to
-behaving like an ordinary 3.8 server.
+above 8 is answered with 8, so a newer version announcement falls back to
+ordinary RFB 3.8 behavior.
 
 The differences are small and every one of them fails the same way — a client waiting
 for bytes that are never coming, against a server waiting for the bytes it should have
@@ -319,8 +318,8 @@ DER, so going via PEM would mean carrying a base64 decoder to read back somethin
 person needs to read.
 
 Both ends default to *offering* encryption rather than requiring it, because a client
-that has never heard of VeNCrypt still has to be able to connect — macOS's own viewer
-speaks RFB 3.3, which has no security negotiation at all. That leaves a downgrade open:
+that has never heard of VeNCrypt can still connect. RFB 3.3 has no security
+negotiation at all. Offering encryption as optional leaves a downgrade open:
 anyone in the middle can strip the encrypted option from a list that also contains an
 unencrypted one. `VNC_TLS=require` removes the choice, at either end.
 

@@ -130,6 +130,10 @@ fn one_frame_from(minor: u32) -> String {
     let status = Command::new(env!("CARGO_BIN_EXE_vncfree"))
         .arg(addr.to_string())
         .arg(&out)
+        .env(
+            "APPDATA",
+            out.with_extension(format!("{}-appdata", std::process::id())),
+        )
         .env("VNC_PASSWORD", PASSWORD)
         .env("VNC_ENCODING", "raw")
         .env_remove("VNC_TLS")
@@ -208,6 +212,10 @@ fn no_security_result_follows_none_before_3_8() {
     let _ = Command::new(env!("CARGO_BIN_EXE_vncfree"))
         .arg(addr.to_string())
         .arg(&out)
+        .env(
+            "APPDATA",
+            out.with_extension(format!("{}-appdata", std::process::id())),
+        )
         .env("VNC_PASSWORD", PASSWORD)
         .env_remove("VNC_TLS")
         .status();
@@ -239,6 +247,10 @@ fn a_rejected_password_is_reported_without_a_reason_string() {
     let got = Command::new(env!("CARGO_BIN_EXE_vncfree"))
         .arg(addr.to_string())
         .arg(&out)
+        .env(
+            "APPDATA",
+            out.with_extension(format!("{}-appdata", std::process::id())),
+        )
         .env("VNC_PASSWORD", PASSWORD)
         .env_remove("VNC_TLS")
         .output()

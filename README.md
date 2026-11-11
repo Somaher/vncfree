@@ -1,12 +1,12 @@
 # vncfree
 
-A free, modern, open-source VNC **client and server** for Windows 11, and a client
-for **Android**. MIT licensed.
+This is my customized version of vncfree, adjusted to my liking for use in a LAN environment.
+
 Free forever. No spyware, no bundled junk, no "free trial" nag screens, no telemetry,
 no accounts, no subscription, no ad-gated download.
 
 Two self-contained executables. Run them, close them, delete them. No installer, no
-service, nothing running when you are not using it.
+service. Optional autostart runs the server headless when you log in.
 
 ## Why
 
@@ -48,15 +48,35 @@ Double click either one and it asks what it needs.
 - **`vncfree-server.exe`** — shows this machine's address on the local network and asks
   for a password. **Start server** stays greyed out until you type one.
 
-Both are equally driveable from a script or a shortcut; the dialogs only appear when
-the arguments and environment variables are absent.
+Both are driveable from a script or a shortcut. Starting the server without arguments
+always opens its dialog. **Load config** is enabled when a saved server config can be
+decrypted and contains a password and valid listen address. Click it to fill in the
+fields, then **Start server** to apply the saved settings and start sharing.
+The server dialog also offers TLS mode, capture method, primary/all displays,
+and **Autostart at login**. **Start server** applies
+your edits and saves them encrypted. **Hide console after start** applies only to
+that launch and is never saved. **Load config** fills all persistent controls.
+
+**Autostart at login** creates a per-user Windows Task Scheduler task when you press
+**Start server**. It runs this executable with `--headless` when you log in, using
+your encrypted saved settings and normal user privileges. It runs only while you
+are logged in, so it can share your desktop. No password is stored in the task.
+Uncheck the option and press **Start server** to remove the task. Its name starts
+with `vncfree-server-`; keep the executable in the same location, or re-enable
+autostart after moving it. Task Scheduler is the source of truth for this checkbox;
+**Load config** does not change it.
+Task changes first use your current permissions. If Windows denies access and the
+process is not already elevated, a UAC prompt requests administrator approval for
+the task update only. The task still targets your original Windows login and uses
+normal user privileges. Cancelling the prompt reports an error without starting
+another server process.
 
 ```powershell
 vncfree 192.168.1.50:5900              # connect
 vncfree 192.168.1.50:5900 frame.ppm    # grab one frame headless and exit
 
 $env:VNC_PASSWORD = 'up to 8 chars'
-vncfree-server                          # share this screen on 0.0.0.0:5900
+vncfree-server                          # open the server dialog
 vncfree-server --password "secret" --headless  # no dialogs or console
 ```
 
@@ -64,54 +84,67 @@ Server arguments: `--password VALUE` (or `--password=VALUE`) overrides
 `VNC_PASSWORD`. `--no-ui` (alias `--hide-ui`) disables all dialogs and fails if no
 password is supplied. `--hide-console` detaches the server from its console without
 hiding your terminal; `--headless` combines both. Use `--help` to list the options.
-With `--headless` or `--no-ui`, a missing password prints an error to stderr and
-exits with code 1 before detaching the console.
+With `--headless` or `--no-ui`, if there is no supplied or saved password, the server
+prints an error to stderr and exits with code 1 before detaching the console.
 Command-line passwords can be visible in process listings; `VNC_PASSWORD` remains
 available.
 
 Close the client window to quit — Escape is forwarded to the remote machine, so it
 can't also be the quit key.
 
-### Android
-
-The same client engine as the Windows viewer, in an app. Type an address (the port
-defaults to 5900), a password, and a username only for a Mac.
-
-- **One finger is the mouse.** Tap to click, hold and let go to right-click, drag to drag.
-- **Two fingers zoom and pan** the view, and never reach the remote machine.
-- **Keyboard** brings up the soft keyboard; a hardware keyboard works throughout,
-  arrows, Ctrl and Alt included. **Paste** *types* the phone's clipboard at the remote
-  machine, which works even on a Mac. Text copied on the remote machine lands on the
-  phone's clipboard.
-- **PC keys** opens a strip above the soft keyboard with what a phone keyboard lacks:
-  Esc, Tab, arrows, Home/End, PgUp/PgDn, Ins, Del, PrtSc, Menu and F1–F12. Ctrl, Alt,
-  Shift and Win/Cmd are sticky — tap one (it lights up), then the next key from the
-  strip or the soft keyboard is sent with it held, so Ctrl, then `c`, is Ctrl-C. Tap a
-  lit modifier again to let go of it.
-- **Screen 1** (shown only when the server has more than one monitor) picks which
-  monitor to show, or all of them side by side. That needs vncfree-server at the other
-  end; it is not something other servers offer over VNC.
-- **Close**, or Back, disconnects.
-
-It remembers the address and username, never the password, and keeps the TLS
-known-hosts list in its own private storage.
-
 ### Settings
 
-All environment variables. There is no config file.
+On Windows, settings are saved in `%APPDATA%\vncfree\server.cfg` and
+`%APPDATA%\vncfree\client.cfg`. The entire file is encrypted with Windows DPAPI for
+the current Windows account, including passwords. Client and server settings are
+kept separate.
+
+Precedence is **command-line arguments > environment variables > saved settings >
+defaults**. In the server dialog, your edits override the initial environment values.
+Settings supplied through `VNC_*` variables and passwords supplied on the
+command line or in a dialog are saved automatically at startup. If no password is
+supplied (including an empty value), the saved password is used. Server visibility
+options (`--headless`, `--no-ui`, `--hide-console`, `VNC_NO_UI`, and
+`VNC_HIDE_CONSOLE`) apply only to the current launch and are never saved. Visibility
+flags in older config files are ignored and removed on the next save.
+A launch without arguments always opens the dialog and
+waits for **Load config** rather than automatically applying saved settings. For
+scripted startup using saved settings, pass `--headless` or `--no-ui`.
+`VNC_HIDE_CONSOLE=0` keeps the console attached unless `--hide-console` or `--headless`
+is explicitly supplied.
+
+To change settings, supply the new environment values or server arguments once;
+subsequent launches use the saved values. For example:
+
+```powershell
+$env:VNC_BIND = '127.0.0.1:5900'
+vncfree-server --password "secret" --headless
+# Later, reuse the saved config without VNC_* variables:
+vncfree-server --headless
+```
+
+The `.cfg` files are encrypted binary files, so edit settings through the server GUI,
+arguments, or environment rather than a text editor. Delete the appropriate `.cfg` to reset its
+saved settings. A damaged file or a file that cannot be decrypted produces an error;
+it is preserved until you reset it. In the no-argument dialog, an invalid config
+disables **Load config**; you can enter new settings and start to replace it.
+Config files always live under `%APPDATA%`;
+`VNC_STATE` only controls TLS state files.
 
 | Variable | Effect |
 |---|---|
 | `VNC_PASSWORD` | Password. The server refuses to start without one. **Only the first 8 characters count** - that is VNC authentication, not a choice made here. |
-| `VNC_USERNAME` | macOS account name. Only needed for a Mac. |
+| `VNC_ADDRESS` | Client only. Prefills the saved connection address in the dialog. An address argument overrides it. |
 | `VNC_BIND` | Server only. Where to listen; default `0.0.0.0:5900`. |
+| `VNC_NO_UI` | Server only. `1` disables dialogs; `0` restores them when a password is needed. |
+| `VNC_HIDE_CONSOLE` | Server only. `1` detaches the console; `0` keeps it attached. |
 | `VNC_VIEW_ONLY=1` | Watch without sending input. Also blocks clipboard writes. |
 | `VNC_TLS` | `offer` (default), `require` or `off`. On the client, `require` refuses to connect to a server that will not encrypt. |
-| `VNC_STATE` | Where the two files below live. A path — `.` keeps them beside the executable — or `off` to write nothing at all. |
+| `VNC_STATE` | Where the TLS state files below live. A path — `.` keeps them beside the executable — or `off` to disable TLS state persistence. |
 | `VNC_ENCODING` | Client only. `raw`, `tight` or `zrle` to ask for exactly one. Answers "is it my decoder or the server?" |
 | `VNC_QUALITY` | Client only, `0`–`9`. Lets a Tight server send lossy JPEG, which is much smaller on a slow link. Unset means lossless. |
-| `VNC_DEBUG=1` | Print the negotiated version, security types and clipboard traffic. |
-| `VNC_TIMING=1` | Client only. Print each second's breakdown: frame rate, where the time went, bytes off the wire, and input-to-picture. Answers `why is this slow` with numbers. |
+| `VNC_DEBUG` | `1` prints the negotiated version, security types and clipboard traffic; `0` disables it. |
+| `VNC_TIMING` | `1` prints each second's performance breakdown on the client or server; `0` disables it. |
 | `VNC_CAPTURE=gdi` | Server only. Force `BitBlt` instead of Desktop Duplication. |
 | `VNC_MONITOR=all` | Server only. Share every display as one screen, not just the primary. |
 | `VNC_NO_PIPELINE=1` | Client only. Ask for each frame only after decoding the last. Slower; for servers that mishandle an early request. |
@@ -119,16 +152,16 @@ All environment variables. There is no config file.
 | `VNC_NO_CURSOR=1` | Client only. Let the server paint the pointer into the picture instead of drawing it locally. Laggier, but it shows the remote machine's own pointer movement. |
 | `VNC_SCROLL_DIVISOR` | Client only. Scroll delta per wheel click sent, default `12` (one plain mouse-wheel notch). A touchpad's driver picks its own units for the same swipe - lower this if scrolling feels slow, raise it if a light touch sends too much. |
 
-Credentials come from the environment rather than the command line, because argv is
-visible to every process on the machine.
+### Files it writes
 
-### The only two files it writes
-
-Both live in `%APPDATA%\vncfree`, both are yours to delete, and there is nothing else
-anywhere — no registry keys, no installer, no service.
+These files live in `%APPDATA%\vncfree` and are yours to delete. Optional autostart
+also registers the per-user scheduled task described above. There is no installer
+or Windows service.
 
 | File | What it is |
 |---|---|
+| `server.cfg` | Server settings and password, encrypted with Windows DPAPI. |
+| `client.cfg` | Windows client settings and password, encrypted with Windows DPAPI. |
 | `server-cert` | The server's TLS certificate and its private key, made on first run. Kept so its fingerprint stays the same, because one that changed on every restart would be a fingerprint nobody could check anything against. |
 | `known_hosts` | One line per address the **client** has connected to, with the certificate it saw. A plain text file. |
 
@@ -138,7 +171,8 @@ first connection safe — nothing can, without a certificate authority — but i
 someone who starts intercepting a connection you have used before.
 
 If a server really was rebuilt, delete its line from `known_hosts` and connect again.
-`VNC_STATE=off` turns all of this off: nothing is written, and nothing is checked.
+`VNC_STATE=off` disables TLS state files and certificate pinning. Encrypted `.cfg`
+settings are still loaded and saved.
 
 ## What it does
 
@@ -147,13 +181,12 @@ If a server really was rebuilt, delete its line from `known_hosts` and connect a
 | **Client** | Live window, keyboard, mouse, shared clipboard, automatic reconnect with backoff, view-only mode. **Ctrl-Shift-V** types the local clipboard at the remote machine, for servers that will not share one. **Ctrl-Shift-M** shows the next monitor, against vncfree-server |
 | **Server** | Desktop Duplication capture with the cursor, keyboard and mouse injection, clipboard, mandatory password. An idle desktop costs about 20x less CPU than the `BitBlt` it falls back to |
 | **Encodings** | Raw, CopyRect, ZRLE, and Tight for servers that speak nothing else. A full 3840x2160 screen is 33,177,616 bytes as Raw and 258,871 as ZRLE — 0.8%, a 128x reduction. Scrolling is sent as a move: one measured run shifted 3,974,784 pixels for 64 bytes |
-| **Authentication** | VNC (DES) and Apple Diffie-Hellman, so a **Mac needs nothing changed** |
+| **Authentication** | VNC password authentication (DES challenge-response). |
 | **Encryption** | TLS 1.3 over VeNCrypt, on by default, with the password exchanged inside it. `VNC_TLS=require` refuses to fall back |
-| **Verified against** | TigerVNC, real macOS 15.7.3 Screen Sharing, macOS's own client, and itself |
+| **Protocol checks** | TigerVNC and vncfree client/server sessions. |
 
-Both ends speak RFB 3.3, 3.7 and 3.8. That means **the viewer built into every Mac can
-connect to the server** — Screen Sharing.app asks for 3.3 and would otherwise be locked
-out — and the client is not fussy about what it connects to either.
+Both ends speak RFB 3.3, 3.7 and 3.8 for compatibility with other VNC clients
+and servers.
 
 The server supports 8bpp and 32bpp true colour, including client-selected colour
 maxima and shifts. Raw, ZRLE, and cursor shapes use the negotiated pixel format.
@@ -178,13 +211,6 @@ authentication, so there is no unauthenticated path at all.
   no current TLS library implements; vncfree speaks the X509 form instead. Against
   another client or server the connection falls back to plain VNC auth, which is DES
   and weak by modern standards.
-- **A Mac connection is not encrypted.** macOS offers Apple Diffie-Hellman, not
-  VeNCrypt. That protects the credentials in transit but not the session.
-- **Clipboard does not work against macOS, and cannot.** It works both directions
-  against TigerVNC, but macOS puts clipboard sharing on Apple Remote Desktop's own
-  channel (port 3283) rather than on the VNC connection — established by watching both
-  directions and Apple's own client. **Ctrl-Shift-V types the local clipboard at the
-  remote machine instead**, which works anywhere. See [docs/macos.md](docs/macos.md).
 - **Tight is decode-only.** The client reads it, so servers that offer nothing better
   are no longer stuck on Raw; the server still sends ZRLE, which is a comparable size
   and lossless. Encoding Tight well means a JPEG *encoder*, which is a lot of weight
@@ -209,7 +235,7 @@ authentication, so there is no unauthenticated path at all.
   this, so it is a vncfree extension — two private pseudo-encodings that any other
   server or client ignores. In the Windows viewer **Ctrl-Shift-M** steps through them
   (1, 2 ... then all, then 1 again; the window title says which), and works in
-  view-only mode too. The Android app has a menu for it.
+  view-only mode too.
 - The server follows a resolution change, but a client that did not ask for
   DesktopSize cannot be told, so that session ends and has to reconnect — vncfree's own
   client reconnects by itself.
@@ -217,10 +243,6 @@ authentication, so there is no unauthenticated path at all.
   layout Windows is set to, including AltGr and dead keys, but a shortcut is sent by
   physical key position — Ctrl-C is the key where a US keyboard has C. That is usually
   what people want from a shortcut and is what most viewers do.
-- **Android:** no automatic reconnect yet — a dropped link goes back to the connect
-  screen with the reason. No mouse wheel. 64-bit phones only. The server paints the pointer into
-  the picture, since there is no mouse for a local one to follow. Tested on the
-  emulator against `vncfree-server`; not yet on a real phone or a Mac.
 - Holding a character key sends repeats rather than one long press, because Windows
   reports the repeats. Fine for typing, not for holding a key down in a game.
 - **To control an admin window, run the server as administrator.** Task Manager, Event
@@ -235,19 +257,16 @@ authentication, so there is no unauthenticated path at all.
 
 - **[docs/security.md](docs/security.md)** — what the server hands over, what protects
   it, what does not, and what has been hardened against what.
-- **[docs/macos.md](docs/macos.md)** — connecting to a Mac, what to do when it refuses
-  you, and exactly what has been tested.
 - **[docs/design.md](docs/design.md)** — how it is put together, why each dependency is
   there, and the traps that cost real time.
 - **[docs/testing.md](docs/testing.md)** — standing up a real server to test against,
   and the harness mistakes that make correct code look broken.
-- **[docs/roadmap.md](docs/roadmap.md)** — what is done, and what might come next.
 
 ## Contributors
 
 - **[tariqhamid](https://github.com/tariqhamid)** — opening the session window at a
-  size that fits the screen, so a Retina Mac's double-size framebuffer is no longer
-  mostly off the edge; and touchpad scrolling that follows the swipe
+  size that fits the screen, including large framebuffers; and touchpad scrolling
+  that follows the swipe
   ([#1](https://github.com/sp00nznet/vncfree/pull/1)).
 
 ## Building
@@ -259,18 +278,7 @@ cargo build --release
 Produces `target/release/vncfree.exe` and `target/release/vncfree-server.exe`, with no
 runtime to install.
 
-The Android app needs the Android SDK and NDK 26.1, and the two Android Rust targets:
-
-```
-rustup target add aarch64-linux-android x86_64-linux-android
-cd android && ./gradlew assembleDebug
-```
-
-Gradle runs cargo for each ABI itself, so the APK always carries the engine from the
-same checkout.
-
-Or grab them from [Releases](https://github.com/sp00nznet/vncfree/releases) — built by
-CI straight from a tag, so nobody has to trust a binary from anywhere else.
+Build this customized version from this checkout to include the LAN-specific changes.
 
 ## The sister projects
 

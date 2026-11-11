@@ -1,5 +1,7 @@
 # Security
 
+This customized Windows version is used in a LAN environment.
+
 What this program hands over, what protects it, and what does not. Written plainly
 because a remote-desktop tool that is vague about this is not worth trusting.
 
@@ -38,8 +40,6 @@ because that is what it is.
 - **A server that offers both encrypted and unencrypted connections can be pushed to
   the unencrypted one** by somebody in the middle, because the choice is the client's
   and the list is not signed. `VNC_TLS=require` at either end removes the choice.
-- **A Mac connection is not encrypted.** macOS offers Apple Diffie-Hellman, not
-  VeNCrypt. That protects the credentials in transit and nothing else.
 - **Nothing here defends the machine against the person who logged in.** If someone has
   the password they are that user.
 
@@ -75,8 +75,8 @@ These are the things the code does deliberately rather than by accident:
 
 ## Where the risk is concentrated
 
-`unsafe` is confined to the Windows API calls: screen capture, input injection and the
-dialogs, all in `src/bin/server.rs` and `src/gui.rs`. It is driven by *local* values —
+`unsafe` is confined to Windows API calls: screen capture, input injection, dialogs,
+DPAPI-protected settings, and Task Scheduler registration. It is driven by *local* values —
 screen geometry, cursor bitmaps, window handles — not by anything off the wire. The
 values a peer does control that reach it are a keysym, a pointer coordinate and a button
 mask; the keysym goes through a total match with no indexing, and the other two are

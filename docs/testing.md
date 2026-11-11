@@ -7,6 +7,25 @@ cargo test
 Everything below is about testing against something real, which is where the actual
 bugs were.
 
+## Autostart permissions and elevation
+
+The opt-in Task Scheduler test creates, inspects, updates, and removes a uniquely
+named temporary task:
+
+```powershell
+cargo test --lib autostart::tests::registers_interactive_headless_task_and_removes_it -- --ignored --exact
+```
+
+To check UAC, start the server without administrator rights and enable autostart on
+a Windows account where task registration requires elevation. Accept the prompt and
+verify that the task targets the original account, uses `--headless`, and runs with
+normal user privileges. If a different administrator account approves the prompt,
+the task must still target the original account. The helper should exit after the
+task update; the original server continues at its existing privilege level.
+Repeat with the prompt cancelled and confirm that an error is shown. Permission
+errors in an already elevated process must report failure without another prompt.
+If task registration succeeds without elevation, no prompt should appear.
+
 ## A real server to point at
 
 Any RFB 3.8 server works. What this repo is developed against, via WSL:
@@ -79,9 +98,6 @@ These each cost real time, and each one made correct code look broken:
 - **An idle Xtigervnc can pin its pointer.** With no client connected it overrode
   `xdotool mousemove` entirely. Confirm that behaviour with vncfree *not* running before
   concluding the client mis-mapped a coordinate.
-- **`pbpaste` over SSH needs a full path or a login shell**, and quoting through
-  PowerShell → WSL → SSH mangles enough that a missing binary reads as an empty
-  clipboard. Pipe a script file to `bash -s` rather than nesting quotes three deep.
 - **`cargo` writes progress to stderr.** In PowerShell 5.1, `2>&1` on a native command
   poisons `$?`, so a green build reports failure. Do not trust `$?` after redirecting.
 - **A running `vncfree-server.exe` locks its own binary**, so `cargo build` cannot
@@ -107,9 +123,3 @@ Two things nearly produced a false bug report:
   "is it all one colour?" said missing when it was fine. The taskbar at the bottom of
   the crop is what settled it. Compare against a `CopyFromScreen` of the same virtual
   desktop taken from a DPI-aware process, which is an independent capture path.
-
-## Verifying the Mac path
-
-Requires a real Mac; see [macos.md](macos.md) for what has been confirmed and what has
-not. `VNC_DEBUG=1` prints the negotiated version, the security types offered and which
-one was chosen, which is the only way to see why a Mac refused a connection.

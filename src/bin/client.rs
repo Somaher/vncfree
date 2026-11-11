@@ -6,7 +6,7 @@
 //!
 //! Run with no arguments and it asks where to connect. Given an address it connects
 //! straight away, and a second argument is a path for a headless one-frame PPM dump.
-//! Settings come from the environment: VNC_USERNAME, VNC_PASSWORD, VNC_VIEW_ONLY,
+//! Settings come from the encrypted config or environment: VNC_USERNAME, VNC_PASSWORD, VNC_VIEW_ONLY,
 //! VNC_ENCODING, VNC_DEBUG, VNC_SCROLL_DIVISOR.
 
 use std::collections::HashMap;
@@ -46,8 +46,10 @@ fn ask_where_to_connect() -> Res<Option<Target>> {
         vncfree::gui::Field::new("Username", false, false),
         vncfree::gui::Field::new("Password", true, false),
     ];
-    // Pre-fill from the environment if it is set, so the variable still works.
-    fields[1].value = env::var("VNC_USERNAME").unwrap_or_default();
+    // Explicit environment values override the encrypted configuration.
+    fields[0].value = vncfree::config::var("VNC_ADDRESS").unwrap_or_default();
+    fields[1].value = vncfree::config::var("VNC_USERNAME").unwrap_or_default();
+    fields[2].value = vncfree::config::var("VNC_PASSWORD").unwrap_or_default();
     let note = "Address is host:port, for example 192.168.1.50:5900.\n\
                 Username is only for a Mac - leave it blank if not needed.";
     let check: vncfree::gui::Validator =
@@ -69,14 +71,15 @@ fn ask_where_to_connect() -> Res<Option<Target>> {
 }
 
 fn run() -> Res<()> {
+    vncfree::config::init("client")?;
     let args: Vec<String> = env::args().collect();
     // With no arguments, ask. Arguments and environment variables keep working
     // untouched so scripts and shortcuts do not suddenly pop up a window.
-    let target = match args.get(1) {
+    let mut target = match args.get(1) {
         Some(addr) => Target {
             addr: addr.clone(),
-            user: env::var("VNC_USERNAME").unwrap_or_default(),
-            pass: env::var("VNC_PASSWORD").unwrap_or_default(),
+            user: vncfree::config::var("VNC_USERNAME").unwrap_or_default(),
+            pass: vncfree::config::var("VNC_PASSWORD").unwrap_or_default(),
         },
         None => {
             FROM_GUI.store(true, Ordering::Relaxed);
@@ -86,6 +89,14 @@ fn run() -> Res<()> {
             }
         }
     };
+    if target.pass.is_empty() {
+        target.pass = vncfree::config::var("VNC_PASSWORD").unwrap_or_default();
+    }
+    vncfree::config::save(&[
+        ("VNC_ADDRESS", &target.addr),
+        ("VNC_PASSWORD", &target.pass),
+        ("VNC_USERNAME", &target.user),
+    ])?;
     let writer: Writer = Arc::new(Mutex::new(None));
     let clip: Clip = Arc::new(Mutex::new(String::new()));
     let cursor = SharedCursor::default();
@@ -315,7 +326,7 @@ struct Input {
 
 impl Input {
     fn new(w: Writer, clip: Clip, monitors: Monitors) -> Input {
-        let view_only = env::var("VNC_VIEW_ONLY").is_ok();
+        let view_only = vncfree::config::var("VNC_VIEW_ONLY").is_ok();
         if view_only {
             eprintln!("VNC_VIEW_ONLY set: input will not be sent");
         }
@@ -345,7 +356,7 @@ impl Input {
             held: HashMap::new(),
             typed: Typed::default(),
             scroll_carry: 0.0,
-            scroll_divisor: env::var("VNC_SCROLL_DIVISOR")
+            scroll_divisor: vncfree::config::var("VNC_SCROLL_DIVISOR")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&d: &f32| d > 0.0)
@@ -629,7 +640,7 @@ fn session(
     // One full frame to start with; from here the server is asked for the next one
     // the moment an update begins arriving.
     vnc.request(false)?;
-    vnc.pipeline = env::var("VNC_NO_PIPELINE").is_err();
+    vnc.pipeline = vncfree::config::var("VNC_NO_PIPELINE").is_err();
     while alive.load(Ordering::Relaxed) {
         if !vnc.pipeline {
             vnc.request(true)?;

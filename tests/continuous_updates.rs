@@ -131,6 +131,10 @@ fn the_client_asks_for_updates_it_then_stops_requesting() {
     let status = Command::new(env!("CARGO_BIN_EXE_vncfree"))
         .arg(addr.to_string())
         .arg(&out)
+        .env(
+            "APPDATA",
+            out.with_extension(format!("{}-appdata", std::process::id())),
+        )
         .env("VNC_PASSWORD", PASSWORD)
         .env("VNC_ENCODING", "raw")
         .env_remove("VNC_TLS")
@@ -239,6 +243,10 @@ fn vnc_no_continuous_declines_the_offer() {
     let status = Command::new(env!("CARGO_BIN_EXE_vncfree"))
         .arg(addr.to_string())
         .arg(&out)
+        .env(
+            "APPDATA",
+            out.with_extension(format!("{}-appdata", std::process::id())),
+        )
         .env("VNC_PASSWORD", PASSWORD)
         .env("VNC_ENCODING", "raw")
         .env("VNC_NO_CONTINUOUS", "1")

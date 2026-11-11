@@ -331,7 +331,7 @@ mod win {
         pick: Option<usize>,
         list: &[(i32, i32, usize, usize)],
     ) -> ((i32, i32, usize, usize), usize) {
-        let all = std::env::var("VNC_MONITOR")
+        let all = vncfree::config::var("VNC_MONITOR")
             .map(|v| v == "all")
             .unwrap_or(false);
         // A monitor that has since been unplugged falls back to the default.
@@ -557,7 +557,7 @@ mod win {
                 // region that is exactly one monitor. Sharing several falls back to
                 // BitBlt, which costs the idle-CPU and dirty-rectangle wins. Running
                 // one duplicator per output and compositing them is the upgrade.
-                let dxgi = if std::env::var("VNC_CAPTURE")
+                let dxgi = if vncfree::config::var("VNC_CAPTURE")
                     .map(|v| v == "gdi")
                     .unwrap_or(false)
                 {
@@ -1551,14 +1551,15 @@ static FROM_GUI: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str = "Usage: vncfree-server [OPTIONS]
 
-  --password VALUE   Set the password (overrides VNC_PASSWORD)
-  --no-ui            Disable dialogs; fail if no password is supplied
+  --password VALUE   Set and save the password (overrides VNC_PASSWORD)
+  --no-ui            Disable dialogs; fail if no supplied or saved password
   --hide-ui          Alias for --no-ui
   --hide-console     Detach from the console
   --headless         Disable dialogs and detach from the console
   -h, --help         Show this help
 
-VNC_PASSWORD and the other VNC_* environment settings remain supported.
+Settings are saved encrypted in %APPDATA%\\vncfree\\server.cfg.
+VNC_* environment settings override saved settings.
 VNC authentication uses only the first 8 password characters.";
 
 #[derive(Default)]
@@ -1609,49 +1610,169 @@ fn main() {
     }
 }
 
-/// Ask for a password before serving anything. Shows this machine's address on the
-/// local network so the person at the other end knows what to type.
-///
-/// No public IP is shown. Finding one means asking a third-party server, which sits
-/// badly with a program that promises no telemetry, and putting a DES-authenticated
-/// VNC server on the open internet is not something to encourage with a helpful
-/// label. Tunnel it instead.
-fn ask_for_password(bind: &str) -> Res<Option<(String, String)>> {
+const FORM_KEYS: [&str; 7] = [
+    "VNC_PASSWORD",
+    "VNC_BIND",
+    "VNC_TLS",
+    "VNC_CAPTURE",
+    "VNC_MONITOR",
+    "VNC_AUTOSTART",
+    "VNC_HIDE_CONSOLE",
+];
+
+fn settings_fields(value: impl Fn(&str) -> Option<String>) -> Vec<vncfree::gui::Field> {
+    use vncfree::gui::{Field, FieldKind};
+    let mut fields = vec![
+        Field::new("Password", true, true),
+        Field::new("Listen on", false, true),
+        Field::choice(
+            "TLS encryption",
+            &[
+                ("offer", "Offer TLS"),
+                ("require", "Require TLS"),
+                ("off", "Off"),
+            ],
+        ),
+        Field::choice(
+            "Screen capture",
+            &[("auto", "Automatic"), ("gdi", "GDI (BitBlt)")],
+        ),
+        Field::choice(
+            "Displays to share",
+            &[("primary", "Primary display"), ("all", "All displays")],
+        ),
+        Field::checkbox("Autostart at login"),
+        Field::checkbox("Hide console after start"),
+    ];
+    fields[1].value = "0.0.0.0:5900".into();
+    fields[5].load_config = false; // Actual Task Scheduler state, not a config value.
+    fields[6].load_config = false; // Current launch only.
+    for (field, key) in fields.iter_mut().zip(FORM_KEYS) {
+        if let Some(value) = value(key) {
+            field.value = match field.kind {
+                FieldKind::Checkbox => if value.is_empty() || value == "0" {
+                    "0"
+                } else {
+                    "1"
+                }
+                .into(),
+                FieldKind::Choice(_) if value.is_empty() => field.value.clone(),
+                _ => value,
+            };
+        }
+    }
+    fields
+}
+
+fn validate_settings(fields: &[vncfree::gui::Field]) -> Option<String> {
+    if let Some(error) = vncfree::gui::check_host_port("Listen on", &fields[1].value) {
+        return Some(error);
+    }
+    for field in fields {
+        if let vncfree::gui::FieldKind::Choice(choices) = field.kind {
+            if !choices.iter().any(|choice| choice.0 == field.value) {
+                return Some(format!("Choose a valid value for {}", field.label));
+            }
+        }
+    }
+    None
+}
+
+struct ServerForm {
+    password: String,
+    bind: String,
+    hide_console: bool,
+    autostart: Option<bool>,
+}
+
+/// Edit server settings before serving anything, showing this machine's LAN address.
+fn ask_for_settings(bind: &str, password: &str, hide_console: bool) -> Res<Option<ServerForm>> {
     let note = match vncfree::gui::lan_ip() {
         Some(ip) => format!(
             "This machine is {ip} on the local network.\n\
-             Sessions are encrypted, but do not port-forward this.\n\
+             Choose TLS encryption below. Do not port-forward this.\n\
              Tunnel over SSH or a VPN."
         ),
         None => "Could not work out this machine's local address.".to_string(),
     };
-    let mut fields = vec![
-        vncfree::gui::Field::new("Password", true, true),
-        vncfree::gui::Field::new("Listen on", false, true),
-    ];
+    let mut fields = settings_fields(|key| vncfree::config::var(key).ok());
+    fields[0].value = password.to_string();
     fields[1].value = bind.to_string();
-    let check: vncfree::gui::Validator =
-        |f| vncfree::gui::check_host_port("Listen on", &f[1].value);
-    if !vncfree::gui::form(
+    let autostart = vncfree::autostart::enabled().unwrap_or(false);
+    fields[5].value = if autostart { "1" } else { "0" }.into();
+    fields[6].value = if hide_console { "1" } else { "0" }.into();
+    let saved = vncfree::config::saved().ok().flatten().filter(|values| {
+        values
+            .get("VNC_PASSWORD")
+            .is_some_and(|p| !p.trim().is_empty())
+            && values.contains_key("VNC_BIND")
+            && validate_settings(&settings_fields(|key| values.get(key).cloned())).is_none()
+    });
+    let load_values = saved.as_ref().map(|values| {
+        let mut loaded = settings_fields(|key| values.get(key).cloned());
+        // Task Scheduler owns autostart; config loading must not change it or
+        // this launch's visibility.
+        loaded[5].value = fields[5].value.clone();
+        loaded[6].value = fields[6].value.clone();
+        loaded.into_iter().map(|field| field.value).collect()
+    });
+    let (accepted, loaded) = vncfree::gui::form_with_load(
         "vncfree-server",
         &note,
         &mut fields,
         "Start server",
-        Some(check),
-    ) {
+        Some(validate_settings),
+        load_values,
+    );
+    if !accepted {
         return Ok(None);
     }
-    Ok(Some((
-        fields[0].value.clone(),
-        fields[1].value.trim().to_string(),
-    )))
+    if loaded {
+        vncfree::config::apply_saved(saved.unwrap());
+    }
+    fields[1].value = fields[1].value.trim().to_string();
+    vncfree::config::override_values(
+        FORM_KEYS
+            .into_iter()
+            .zip(&fields)
+            .map(|(key, field)| (key.to_string(), field.value.clone()))
+            .collect(),
+    );
+    Ok(Some(ServerForm {
+        password: fields[0].value.clone(),
+        bind: fields[1].value.clone(),
+        hide_console: fields[6].value == "1",
+        // With no existing task and an unchecked box, leave Task Scheduler alone.
+        autostart: if autostart || fields[5].value == "1" {
+            Some(fields[5].value == "1")
+        } else {
+            None
+        },
+    }))
 }
 
 fn run() -> Res<()> {
-    let options = Options::parse(std::env::args().skip(1))?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--autostart-helper") {
+        if let Err(error) = vncfree::autostart::run_elevated_helper(&args[1..]) {
+            eprintln!("administrator task update failed: {error}");
+            std::process::exit(error.code().0);
+        }
+        return Ok(());
+    }
+    let interactive = args.is_empty();
+    let mut options = Options::parse(args)?;
     if options.help {
         println!("{USAGE}");
         return Ok(());
+    }
+    if interactive {
+        FROM_GUI.store(true, Ordering::Relaxed);
+        vncfree::config::init_empty("server")?;
+    } else {
+        vncfree::config::init("server")?;
+        options.no_ui |= vncfree::config::var("VNC_NO_UI").is_ok_and(|v| v == "1");
+        options.hide_console |= vncfree::config::var("VNC_HIDE_CONSOLE").is_ok_and(|v| v == "1");
     }
     win::become_dpi_aware();
 
@@ -1660,24 +1781,32 @@ fn run() -> Res<()> {
     // exactly the decision that makes remote-access software dangerous.
     let mut password = options
         .password
-        .unwrap_or_else(|| std::env::var("VNC_PASSWORD").unwrap_or_default());
-    let mut bind = std::env::var("VNC_BIND").unwrap_or_else(|_| "0.0.0.0:5900".into());
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| vncfree::config::var("VNC_PASSWORD").unwrap_or_default());
+    let mut bind = vncfree::config::var("VNC_BIND").unwrap_or_else(|_| "0.0.0.0:5900".into());
+    let mut autostart = None;
 
     // No password supplied: ask for one. The dialog's Start button stays
     // disabled until a password is typed, so there is no path to an open server.
-    if password.is_empty() {
-        if options.no_ui {
+    if interactive || password.is_empty() {
+        if !interactive && options.no_ui {
             return Err(
                 "no password supplied: --headless/--no-ui requires a nonempty \
-                        --password VALUE or VNC_PASSWORD; server was not started"
+                        --password VALUE, VNC_PASSWORD, or saved password; server was not started"
                     .into(),
             );
         }
         FROM_GUI.store(true, Ordering::Relaxed);
-        match ask_for_password(&bind)? {
-            Some((p, b)) => {
-                password = p;
-                bind = b;
+        match ask_for_settings(
+            &bind,
+            &password,
+            options.hide_console || vncfree::config::enabled("VNC_HIDE_CONSOLE"),
+        )? {
+            Some(form) => {
+                password = form.password;
+                bind = form.bind;
+                options.hide_console = form.hide_console;
+                autostart = form.autostart;
             }
             None => return Ok(()), // window closed
         }
@@ -1690,7 +1819,11 @@ fn run() -> Res<()> {
                     the network is not trusted."
             .into());
     }
-    // Validate credentials before detaching so startup errors reach stderr even
+    vncfree::config::save(&[("VNC_PASSWORD", &password), ("VNC_BIND", &bind)])?;
+    if let Some(enabled) = autostart {
+        vncfree::autostart::set_enabled(enabled)?;
+    }
+    // Validate and save credentials before detaching so startup errors reach stderr even
     // when --headless was requested.
     if options.hide_console {
         // Detach this process only: hiding the console window would also hide
@@ -1994,7 +2127,7 @@ fn stick(total: &AtomicU64, max: &AtomicU64, at: std::time::Instant) {
 }
 
 fn timing() -> bool {
-    std::env::var("VNC_TIMING").is_ok()
+    vncfree::config::enabled("VNC_TIMING")
 }
 
 impl ServerTiming {
@@ -2092,7 +2225,7 @@ enum TlsMode {
 
 impl TlsMode {
     fn from_env() -> Res<TlsMode> {
-        match std::env::var("VNC_TLS").unwrap_or_default().as_str() {
+        match vncfree::config::var("VNC_TLS").unwrap_or_default().as_str() {
             "" | "offer" => Ok(TlsMode::Offer),
             "require" => Ok(TlsMode::Require),
             "off" => Ok(TlsMode::Off),
@@ -2665,6 +2798,19 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_saved_gui_settings_are_rejected_before_loading() {
+        let mut fields = settings_fields(|_| None);
+        assert!(validate_settings(&fields).is_none());
+        fields[2].value = "not-a-tls-mode".into();
+        assert!(validate_settings(&fields)
+            .unwrap()
+            .contains("TLS encryption"));
+        fields[2].value = "require".into();
+        fields[1].value = "127.0.0.1:99999".into();
+        assert!(validate_settings(&fields).is_some());
+    }
 
     #[test]
     fn startup_arguments_set_password_and_visibility() {

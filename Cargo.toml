@@ -1,6 +1,6 @@
 [package]
 name = "vncfree"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "A free VNC client and server for Windows. No subscription, no telemetry, no installer."
 repository = "https://github.com/sp00nznet/vncfree"
@@ -8,10 +8,6 @@ license = "MIT"
 readme = "README.md"
 keywords = ["vnc", "rfb", "remote-desktop", "windows"]
 categories = ["network-programming", "command-line-utilities"]
-
-# The Android app's JNI bridge lives in android/jni and builds against this library.
-[workspace]
-members = ["android/jni"]
 
 # Shared RFB protocol pieces. The two binaries below are the client and the server.
 [lib]
@@ -42,9 +38,8 @@ rustls-pki-types = "1.15.1"
 sha2 = "0.11.0"
 jpeg-decoder = { version = "0.3.2", default-features = false }
 
-# Windows client only: window, and clipboard without the image-format baggage. Kept off
-# Android so the library cross-compiles for the app, which has its own window.
-[target.'cfg(not(target_os = "android"))'.dependencies]
+# Windows client: window and clipboard without the image-format baggage.
+[target.'cfg(windows)'.dependencies]
 minifb = "0.28.0"
 arboard = { version = "3.6.1", default-features = false }
 
@@ -56,10 +51,12 @@ features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
     "Win32_System_LibraryLoader",
     "Win32_System_Console",
+    "Win32_Security_Cryptography",
 ]
 
 # Desktop Duplication is COM, and windows-sys has no COM support - it would be several
@@ -74,6 +71,15 @@ features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_Security_Authentication_Identity",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
     # DXGI_OUTPUT_DESC carries an HMONITOR, so GetDesc needs this too.
     "Win32_Graphics_Gdi",
 ]

@@ -15,6 +15,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HFONT, HGDIOBJ, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED};
 use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SetThreadDpiAwarenessContext,
     SystemParametersInfoForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -74,6 +75,15 @@ pub struct Field {
     /// The action button stays disabled until every required field has something in
     /// it. This is how the server refuses to start without a password.
     pub required: bool,
+    pub kind: FieldKind,
+    /// Whether Load config may overwrite this control's current value.
+    pub load_config: bool,
+}
+
+pub enum FieldKind {
+    Text,
+    Choice(&'static [(&'static str, &'static str)]),
+    Checkbox,
 }
 
 impl Field {
@@ -83,7 +93,23 @@ impl Field {
             value: String::new(),
             secret,
             required,
+            kind: FieldKind::Text,
+            load_config: true,
         }
+    }
+
+    pub fn choice(label: &'static str, choices: &'static [(&'static str, &'static str)]) -> Field {
+        let mut field = Self::new(label, false, false);
+        field.value = choices[0].0.to_string();
+        field.kind = FieldKind::Choice(choices);
+        field
+    }
+
+    pub fn checkbox(label: &'static str) -> Field {
+        let mut field = Self::new(label, false, false);
+        field.value = "0".into();
+        field.kind = FieldKind::Checkbox;
+        field
     }
 }
 
@@ -97,6 +123,8 @@ struct State {
     fields: *mut Vec<Field>,
     validate: Option<Validator>,
     ok: bool,
+    load_values: Option<Vec<String>>,
+    loaded: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -115,6 +143,44 @@ fn read_text(hwnd: HWND) -> String {
     }
 }
 
+unsafe fn read_field(field: &Field, control: HWND) -> String {
+    match field.kind {
+        FieldKind::Text => read_text(control),
+        FieldKind::Choice(choices) => {
+            let index = SendMessageW(control, CB_GETCURSEL, 0, 0) as usize;
+            choices.get(index).map(|c| c.0).unwrap_or("").to_string()
+        }
+        FieldKind::Checkbox => {
+            if SendMessageW(control, BM_GETCHECK, 0, 0) == BST_CHECKED as isize {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+    }
+}
+
+unsafe fn set_field(field: &Field, control: HWND, value: &str) {
+    match field.kind {
+        FieldKind::Text => {
+            SetWindowTextW(control, wide(value).as_ptr());
+        }
+        FieldKind::Choice(choices) => {
+            let index = choices.iter().position(|c| c.0 == value).unwrap_or(0);
+            SendMessageW(control, CB_SETCURSEL, index, 0);
+        }
+        FieldKind::Checkbox => {
+            let checked = !value.is_empty() && value != "0";
+            SendMessageW(
+                control,
+                BM_SETCHECK,
+                if checked { BST_CHECKED } else { BST_UNCHECKED } as usize,
+                0,
+            );
+        }
+    }
+}
+
 /// Whether the action button should be usable: every required field has something
 /// other than whitespace in it. Kept separate from the window plumbing so it can be
 /// tested - this is what stops the server being started without a password.
@@ -129,7 +195,7 @@ unsafe fn refresh_button(st: &State) {
     let state: Vec<(bool, String)> = fields
         .iter()
         .zip(&st.edits)
-        .map(|(f, &e)| (f.required, read_text(e)))
+        .map(|(f, &e)| (f.required, read_field(f, e)))
         .collect();
     EnableWindow(st.button, ready(&state) as i32);
 }
@@ -140,13 +206,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_COMMAND if !st.is_null() => {
             let code = (wp >> 16) as u32;
             let id = (wp & 0xffff) as u16;
-            if code == EN_CHANGE {
+            if code == EN_CHANGE
+                || (code == CBN_SELCHANGE && id >= 100)
+                || (code == BN_CLICKED && id >= 100)
+            {
                 refresh_button(&*st);
+            } else if code == BN_CLICKED && id == 2 {
+                if let Some(values) = &(*st).load_values {
+                    (*st).loaded = true;
+                    for ((field, &edit), value) in
+                        (&*(*st).fields).iter().zip(&(*st).edits).zip(values)
+                    {
+                        if field.load_config {
+                            set_field(field, edit, value);
+                        }
+                    }
+                    refresh_button(&*st);
+                }
             } else if code == BN_CLICKED && id == 1 {
                 // Copy the box contents back out before the window goes away.
                 let fields = &mut *(*st).fields;
                 for (f, &e) in fields.iter_mut().zip(&(*st).edits) {
-                    f.value = read_text(e);
+                    f.value = read_field(f, e);
                 }
                 // Complain and stay open rather than closing on a typo and reporting
                 // it to a window that no longer exists.
@@ -193,6 +274,31 @@ pub fn form(
     button: &str,
     validate: Option<Validator>,
 ) -> bool {
+    form_inner(title, note, fields, button, validate, false, None).0
+}
+
+/// A form with a Load config button. Missing or mismatched values disable it.
+/// The second result indicates whether the saved values were loaded.
+pub fn form_with_load(
+    title: &str,
+    note: &str,
+    fields: &mut Vec<Field>,
+    button: &str,
+    validate: Option<Validator>,
+    load_values: Option<Vec<String>>,
+) -> (bool, bool) {
+    form_inner(title, note, fields, button, validate, true, load_values)
+}
+
+fn form_inner(
+    title: &str,
+    note: &str,
+    fields: &mut Vec<Field>,
+    button: &str,
+    validate: Option<Validator>,
+    show_load: bool,
+    load_values: Option<Vec<String>>,
+) -> (bool, bool) {
     unsafe {
         // Per-thread rather than per-process, so the dialog renders crisply on a
         // high-DPI screen without changing how the rest of the program - notably the
@@ -240,7 +346,7 @@ pub fn form(
         );
         if hwnd.is_null() {
             SetThreadDpiAwarenessContext(prev_dpi);
-            return false;
+            return (false, false);
         }
 
         let dpi = GetDpiForWindow(hwnd).max(96);
@@ -313,18 +419,40 @@ pub fn form(
                 0,
             );
             set_font(l);
-            let extra = if f.secret { ES_PASSWORD as u32 } else { 0 };
+            let (control_style, class, caption, control_h) = match f.kind {
+                FieldKind::Text => (
+                    WS_BORDER
+                        | ES_AUTOHSCROLL as u32
+                        | if f.secret { ES_PASSWORD as u32 } else { 0 },
+                    "EDIT",
+                    "",
+                    edit_h,
+                ),
+                FieldKind::Choice(choices) => (
+                    CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
+                    "COMBOBOX",
+                    "",
+                    edit_h + row * choices.len() as i32,
+                ),
+                FieldKind::Checkbox => (BS_AUTOCHECKBOX as u32, "BUTTON", "Enabled", edit_h),
+            };
             let e = child(
-                WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32 | extra,
-                "EDIT",
-                &f.value,
+                WS_TABSTOP | control_style,
+                class,
+                caption,
                 pad * 2 + label_w,
                 y,
                 edit_w,
-                edit_h,
+                control_h,
                 100 + i,
             );
             set_font(e);
+            if let FieldKind::Choice(choices) = f.kind {
+                for &(_, label) in choices {
+                    SendMessageW(e, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+                }
+            }
+            set_field(f, e, &f.value);
             edits.push(e);
             y += row;
         }
@@ -343,12 +471,31 @@ pub fn form(
         );
         set_font(btn);
 
+        let load_values = load_values.filter(|values| values.len() == fields.len());
+        if show_load {
+            let load_w = (text_size(font, "Load config").cx + s(28)).max(s(96));
+            let load = child(
+                WS_TABSTOP | BS_PUSHBUTTON as u32,
+                "BUTTON",
+                "Load config",
+                pad,
+                y + s(6),
+                load_w,
+                edit_h + s(4),
+                2,
+            );
+            set_font(load);
+            EnableWindow(load, load_values.is_some() as i32);
+        }
+
         let mut state = State {
             edits,
             button: btn,
             fields: fields as *mut _,
             validate,
             ok: false,
+            load_values,
+            loaded: false,
         };
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut state as *mut State as isize);
         refresh_button(&state);
@@ -390,7 +537,7 @@ pub fn form(
         }
         DeleteObject(font as HGDIOBJ);
         SetThreadDpiAwarenessContext(prev_dpi);
-        state.ok
+        (state.ok, state.loaded)
     }
 }
 

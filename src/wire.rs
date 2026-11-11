@@ -208,17 +208,17 @@ fn shake(sock: &mut TcpStream, c: &mut rustls::Connection) -> Res<()> {
 /// The one directory vncfree writes to: the server's certificate, and the client's
 /// note of which certificate it has seen from which host.
 ///
-/// Two files, both deletable, and nothing else is ever written anywhere. `VNC_STATE`
+/// These TLS files are separate from the encrypted settings. `VNC_STATE`
 /// moves the directory — pointing it at `.` keeps everything beside the executable, for
 /// running off a stick — or turns it off entirely, which makes the server's certificate
 /// last only as long as the process and stops the client remembering anything.
 pub fn state_dir() -> Option<std::path::PathBuf> {
-    match std::env::var("VNC_STATE") {
+    match crate::config::var("VNC_STATE") {
         Ok(v) if v == "off" => None,
-        Ok(v) => Some(std::path::PathBuf::from(v)),
+        Ok(v) if !v.is_empty() => Some(std::path::PathBuf::from(v)),
         // No APPDATA is not an error worth failing a connection over; it just means
         // there is nowhere to remember things.
-        Err(_) => std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("vncfree")),
+        _ => std::env::var_os("APPDATA").map(|a| std::path::PathBuf::from(a).join("vncfree")),
     }
 }
 

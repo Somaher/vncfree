@@ -2,15 +2,17 @@
 //!
 //! What both ends share is here: the wire primitives, the framebuffer layout, the
 //! VNC-auth key derivation (one side answers the challenge, the other sets it) and the
-//! clipboard text encoding. `rfb` is the client's protocol engine, kept out of the
-//! Windows binary so the Android app can run it too; encoding stays in the server.
+//! clipboard text encoding. `rfb` is the Windows client's protocol engine;
+//! encoding stays in the server.
 
+#[cfg(windows)]
+pub mod autostart;
+pub mod config;
 #[cfg(windows)]
 pub mod gui;
 pub mod rfb;
 pub mod wire;
 
-use std::env;
 use std::io::Read;
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -115,7 +117,7 @@ pub fn vnc_des(challenge: &mut [u8; 16], password: &str) {
 /// connection is refused, the useful facts are the peer's version, the security types
 /// offered and which one was picked, and none of those are visible from the error.
 pub fn debug() -> bool {
-    env::var("VNC_DEBUG").is_ok()
+    crate::config::enabled("VNC_DEBUG")
 }
 
 pub struct Screen {

@@ -1,8 +1,6 @@
 //! The client half of RFB: connect, authenticate, decode. Everything a viewer needs
-//! except the window, so the Windows client and the Android app run the same code and
-//! a decoder fix lands in both.
+//! except the window, which lives in the Windows client binary.
 
-use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -322,7 +320,7 @@ impl Vnc {
                  security types offered {types:?}"
             );
         }
-        let want_tls = env::var("VNC_TLS").unwrap_or_default() == "require";
+        let want_tls = crate::config::var("VNC_TLS").unwrap_or_default() == "require";
         // VeNCrypt first: it is the only one of these that encrypts anything.
         let chosen = if types.contains(&19) {
             19 // VeNCrypt: TLS, then one of the others inside it
@@ -440,7 +438,10 @@ impl Vnc {
         // giving us lossless ZRLE, and Tight is there for the servers that do not speak
         // ZRLE at all, where the fallback would otherwise be Raw. Tight is the only one
         // that can arrive lossy, and only because a server chose to send JPEG.
-        let mut encodings: Vec<i32> = match env::var("VNC_ENCODING").unwrap_or_default().as_str() {
+        let mut encodings: Vec<i32> = match crate::config::var("VNC_ENCODING")
+            .unwrap_or_default()
+            .as_str()
+        {
             "raw" => {
                 eprintln!("VNC_ENCODING=raw: requesting Raw only");
                 vec![0]
@@ -473,7 +474,7 @@ impl Vnc {
         //        the screen, and it cannot move until a whole round trip completes.
         //   MONITORS: vncfree's own, below. Any other server ignores it.
         encodings.extend_from_slice(&[-223, -313, MONITORS]);
-        if env::var("VNC_NO_CURSOR").is_err() {
+        if crate::config::var("VNC_NO_CURSOR").is_err() {
             encodings.push(-239);
         } else {
             eprintln!("VNC_NO_CURSOR set: letting the server draw the pointer");
@@ -483,7 +484,7 @@ impl Vnc {
         // lossy and much smaller. Unset means lossless, because a remote desktop is
         // mostly text and JPEG makes a mess of text. The levels are pseudo-encodings
         // -32 (worst) to -23 (best).
-        if let Ok(q) = env::var("VNC_QUALITY") {
+        if let Ok(q) = crate::config::var("VNC_QUALITY") {
             let level: i32 = q
                 .parse()
                 .ok()
@@ -606,7 +607,7 @@ impl Vnc {
                 // EndOfContinuousUpdates. Unprompted, this is how a server announces it
                 // supports them at all; in reply to a disable it means the last update
                 // has been sent. Either way it carries no body.
-                if !self.continuous && env::var("VNC_NO_CONTINUOUS").is_err() {
+                if !self.continuous && crate::config::var("VNC_NO_CONTINUOUS").is_err() {
                     self.enable_continuous()?;
                 }
                 Ok(false)
@@ -649,8 +650,7 @@ pub const MAX_TYPED: usize = 4000;
 /// Turn text into the keys needed to type it: each entry is a keysym and whether
 /// shift must be held for it.
 ///
-/// This exists because macOS does not do clipboard over VNC at all - see
-/// docs/macos.md - so the only way to get text onto a Mac is to type it.
+/// This lets text reach servers that do not support clipboard messages.
 ///
 /// Shift is stated explicitly rather than left to the server. RFB says a keysym *is*
 /// the character, but a server that maps 'A' straight onto the A key without holding
@@ -795,7 +795,7 @@ pub fn now_us() -> u64 {
 /// a different question - what was negotiated - and would be unreadable with two lines
 /// a second of measurements mixed into it.
 pub fn timing() -> bool {
-    env::var("VNC_TIMING").is_ok()
+    crate::config::enabled("VNC_TIMING")
 }
 
 /// When the oldest input that has not yet produced a picture was sent, or 0.
